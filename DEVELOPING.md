@@ -137,12 +137,17 @@ controller before unpinning affected pages. MSI-X events raised while a vector
 is masked or has no eventfd are retained in the pending-bit array and replayed
 after the vector becomes usable.
 
-The remaining Layer 1 gate is a rebuilt-kernel VM run proving namespace
-enumeration, direct write/read comparison, flush, discard and controller reset.
-`tools/testing/nvmet-mdev-pci/guest-smoke.sh` performs those destructive guest
-checks after being given an explicit namespace path.
+The first rebuilt-kernel VM run proved namespace enumeration, direct write/read
+comparison, flush, discard and controller reset. It also found that treating
+Linux's 256-byte small PRP-list pool as a page-aligned 4 KiB mapping broke
+buffered readahead. The PRP walker now accepts naturally aligned list pointers
+and fetches only the entries required by the command.
+`tools/testing/nvmet-mdev-pci/guest-smoke.sh` treats new buffered-read kernel
+errors as a test failure. A rebuilt-kernel rerun remains required to validate
+the regression fix.
 
 Layer 2 replaces payload copies with request-lifetime page pinning, then adds
 parallel submission, shadow doorbells, completion batching and interrupt
 coalescing. Those changes are performance work and are intentionally separate
-from the functionally complete copy path.
+from the functionally complete copy path. See `PERFORMANCE.md` for the ordered
+patch series, safety invariants and measurement gates.

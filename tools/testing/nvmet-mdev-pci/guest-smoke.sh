@@ -55,6 +55,18 @@ dd if="$dev" of="$output" bs=1M count=$size_mb iflag=direct status=progress
 cmp "$input" "$output"
 echo "write/read/flush: PASS"
 
+dmesg_lines=$(dmesg | wc -l)
+blockdev --flushbufs "$dev"
+dd if="$dev" of="$output" bs=64K count=$((size_mb * 16)) status=progress
+cmp "$input" "$output"
+dmesg | tail -n "+$((dmesg_lines + 1))" > /tmp/nvmet-mdev-pci-dmesg-new.log
+if grep -E 'nvme.*I/O Cmd.*I/O Error|I/O error, dev nvme' \
+	/tmp/nvmet-mdev-pci-dmesg-new.log; then
+	echo "buffered read generated an NVMe I/O error"
+	exit 1
+fi
+echo "buffered read/readahead: PASS"
+
 if [ "${NVMET_MDEV_TEST_DISCARD:-0}" = 1 ]; then
 	blkdiscard --offset 0 --length $((size_mb * 1024 * 1024)) "$dev"
 	echo "discard completion: PASS"
