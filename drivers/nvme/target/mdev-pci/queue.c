@@ -98,13 +98,22 @@ static int nvmet_mdev_transfer_prps(struct nvmet_mdev_iod *iod,
 		goto out;
 
 	prp = le64_to_cpu(cmd->common.dptr.prp2);
-	if (!prp || !IS_ALIGNED(prp, SZ_4K)) {
+	if (!prp) {
 		ret = -EINVAL;
 		goto out;
 	}
 	if (remaining <= SZ_4K) {
+		if (!IS_ALIGNED(prp, SZ_4K)) {
+			ret = -EINVAL;
+			goto out;
+		}
 		ret = nvmet_mdev_copy_prp_segment(iod, prp, offset, remaining,
-						  write_guest, bounce);
+							  write_guest, bounce);
+		goto out;
+	}
+	/* Linux uses sub-page DMA pools for short PRP lists. */
+	if (!IS_ALIGNED(prp, sizeof(__le64))) {
+		ret = -EINVAL;
 		goto out;
 	}
 
@@ -118,8 +127,11 @@ static int nvmet_mdev_transfer_prps(struct nvmet_mdev_iod *iod,
 	while (remaining) {
 		bool chained = false;
 		unsigned int i;
+		size_t list_bytes;
 
-		ret = vfio_dma_rw(&iod->ctrl->vdev, list_iova, prps, SZ_4K,
+		list_bytes = min_t(size_t, DIV_ROUND_UP(remaining, SZ_4K),
+				   NVMET_MDEV_PRP_ENTRIES) * sizeof(*prps);
+		ret = vfio_dma_rw(&iod->ctrl->vdev, list_iova, prps, list_bytes,
 				  false);
 		if (ret)
 			goto out;
