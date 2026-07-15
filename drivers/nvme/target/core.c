@@ -22,7 +22,12 @@
 struct kmem_cache *nvmet_bvec_cache;
 struct workqueue_struct *buffered_io_wq;
 struct workqueue_struct *zbd_wq;
-static const struct nvmet_fabrics_ops *nvmet_transports[NVMF_TRTYPE_MAX];
+struct nvmet_transport {
+	struct list_head		entry;
+	const struct nvmet_fabrics_ops *ops;
+};
+
+static LIST_HEAD(nvmet_transports);
 static DEFINE_IDA(cntlid_ida);
 
 struct workqueue_struct *nvmet_wq;
@@ -40,7 +45,7 @@ EXPORT_SYMBOL_GPL(nvmet_aen_wq);
  *  - per-subsystem allowed hosts list
  *  - allow_any_host subsystem attribute
  *  - nvmet_genctr
- *  - the nvmet_transports array
+ *  - the nvmet_transports list
  *
  * When updating any of those lists/structures write lock should be obtained,
  * while when reading (populating discovery log page or checking host-subsystem
@@ -278,16 +283,42 @@ void nvmet_port_send_ana_event(struct nvmet_port *port)
 	up_read(&nvmet_config_sem);
 }
 
+static const struct nvmet_fabrics_ops *
+nvmet_lookup_transport(const char *name)
+{
+	struct nvmet_transport *transport;
+
+	list_for_each_entry(transport, &nvmet_transports, entry) {
+		if (!strcmp(transport->ops->name, name))
+			return transport->ops;
+	}
+
+	return NULL;
+}
+
 int nvmet_register_transport(const struct nvmet_fabrics_ops *ops)
 {
+	struct nvmet_transport *transport;
 	int ret = 0;
 
+	if (!ops->name || !ops->name[0] ||
+	    strlen(ops->name) >= sizeof_field(struct nvmet_port, trtype_name))
+		return -EINVAL;
+
+	transport = kzalloc_obj(*transport);
+	if (!transport)
+		return -ENOMEM;
+	transport->ops = ops;
+
 	down_write(&nvmet_config_sem);
-	if (nvmet_transports[ops->type])
-		ret = -EINVAL;
-	else
-		nvmet_transports[ops->type] = ops;
+	if (nvmet_lookup_transport(ops->name)) {
+		ret = -EEXIST;
+	} else {
+		list_add_tail(&transport->entry, &nvmet_transports);
+		transport = NULL;
+	}
 	up_write(&nvmet_config_sem);
+	kfree(transport);
 
 	return ret;
 }
@@ -295,8 +326,16 @@ EXPORT_SYMBOL_GPL(nvmet_register_transport);
 
 void nvmet_unregister_transport(const struct nvmet_fabrics_ops *ops)
 {
+	struct nvmet_transport *transport, *tmp;
+
 	down_write(&nvmet_config_sem);
-	nvmet_transports[ops->type] = NULL;
+	list_for_each_entry_safe(transport, tmp, &nvmet_transports, entry) {
+		if (transport->ops != ops)
+			continue;
+		list_del(&transport->entry);
+		kfree(transport);
+		break;
+	}
 	up_write(&nvmet_config_sem);
 }
 EXPORT_SYMBOL_GPL(nvmet_unregister_transport);
@@ -313,6 +352,28 @@ void nvmet_port_del_ctrls(struct nvmet_port *port, struct nvmet_subsys *subsys)
 	mutex_unlock(&subsys->lock);
 }
 
+int nvmet_port_get_single_subsysnqn(struct nvmet_port *port, char *subsysnqn,
+		size_t subsysnqn_size)
+{
+	struct nvmet_subsys_link *link;
+	int ret = 0;
+
+	down_read(&nvmet_config_sem);
+	if (!list_is_singular(&port->subsystems)) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	link = list_first_entry(&port->subsystems, struct nvmet_subsys_link,
+				entry);
+	strscpy(subsysnqn, link->subsys->subsysnqn, subsysnqn_size);
+
+out_unlock:
+	up_read(&nvmet_config_sem);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(nvmet_port_get_single_subsysnqn);
+
 int nvmet_enable_port(struct nvmet_port *port)
 {
 	const struct nvmet_fabrics_ops *ops;
@@ -320,18 +381,19 @@ int nvmet_enable_port(struct nvmet_port *port)
 
 	lockdep_assert_held(&nvmet_config_sem);
 
-	if (port->disc_addr.trtype == NVMF_TRTYPE_MAX)
+	if (port->disc_addr.trtype == NVMF_TRTYPE_MAX ||
+	    !port->trtype_name[0])
 		return -EINVAL;
 
-	ops = nvmet_transports[port->disc_addr.trtype];
+	ops = nvmet_lookup_transport(port->trtype_name);
 	if (!ops) {
 		up_write(&nvmet_config_sem);
-		request_module("nvmet-transport-%d", port->disc_addr.trtype);
+		request_module("nvmet-transport-%s", port->trtype_name);
 		down_write(&nvmet_config_sem);
-		ops = nvmet_transports[port->disc_addr.trtype];
+		ops = nvmet_lookup_transport(port->trtype_name);
 		if (!ops) {
-			pr_err("transport type %d not supported\n",
-				port->disc_addr.trtype);
+			pr_err("transport %s not supported\n",
+			       port->trtype_name);
 			return -EINVAL;
 		}
 	}
@@ -344,8 +406,8 @@ int nvmet_enable_port(struct nvmet_port *port)
 	 * don't enable the port.
 	 */
 	if (port->pi_enable && !(ops->flags & NVMF_METADATA_SUPPORTED)) {
-		pr_err("T10-PI is not supported by transport type %d\n",
-		       port->disc_addr.trtype);
+		pr_err("T10-PI is not supported by transport %s\n",
+		       port->trtype_name);
 		ret = -EINVAL;
 		goto out_put;
 	}
@@ -393,10 +455,10 @@ void nvmet_disable_port(struct nvmet_port *port)
 
 	lockdep_assert_held(&nvmet_config_sem);
 
+	ops = port->tr_ops;
 	port->enabled = false;
 	port->tr_ops = NULL;
 
-	ops = nvmet_transports[port->disc_addr.trtype];
 	ops->remove_port(port);
 	module_put(ops->owner);
 }

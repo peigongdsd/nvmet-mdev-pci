@@ -2990,6 +2990,7 @@ out_put:
 
 static const struct nvmet_fabrics_ops nvmet_fc_tgt_fcp_ops = {
 	.owner			= THIS_MODULE,
+	.name			= "fc",
 	.type			= NVMF_TRTYPE_FC,
 	.msdbd			= 1,
 	.add_port		= nvmet_fc_add_port,
@@ -3024,3 +3025,4 @@ module_exit(nvmet_fc_exit_module);
 
 MODULE_DESCRIPTION("NVMe target FC transport driver");
 MODULE_LICENSE("GPL v2");
+MODULE_ALIAS("nvmet-transport-fc");

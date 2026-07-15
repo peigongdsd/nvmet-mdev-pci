@@ -2039,6 +2039,7 @@ static u16 nvmet_rdma_get_max_queue_size(const struct nvmet_ctrl *ctrl)
 
 static const struct nvmet_fabrics_ops nvmet_rdma_ops = {
 	.owner			= THIS_MODULE,
+	.name			= "rdma",
 	.type			= NVMF_TRTYPE_RDMA,
 	.msdbd			= 1,
 	.flags			= NVMF_KEYED_SGLS | NVMF_METADATA_SUPPORTED,
@@ -2127,4 +2128,5 @@ module_exit(nvmet_rdma_exit);
 
 MODULE_DESCRIPTION("NVMe target RDMA transport driver");
 MODULE_LICENSE("GPL v2");
+MODULE_ALIAS("nvmet-transport-rdma");
 MODULE_ALIAS("nvmet-transport-1"); /* 1 == NVMF_TRTYPE_RDMA */

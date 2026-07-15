@@ -38,6 +38,7 @@ static struct nvmet_type_name_map nvmet_transport[] = {
 	{ NVMF_TRTYPE_FC,	"fc" },
 	{ NVMF_TRTYPE_TCP,	"tcp" },
 	{ NVMF_TRTYPE_PCI,	"pci" },
+	{ NVMF_TRTYPE_PCI,	"mdev-pci" },
 	{ NVMF_TRTYPE_LOOP,	"loop" },
 };
 
@@ -358,15 +359,8 @@ static ssize_t nvmet_addr_trtype_show(struct config_item *item,
 		char *page)
 {
 	struct nvmet_port *port = to_nvmet_port(item);
-	int i;
 
-	for (i = 0; i < ARRAY_SIZE(nvmet_transport); i++) {
-		if (port->disc_addr.trtype == nvmet_transport[i].type)
-			return snprintf(page, PAGE_SIZE,
-					"%s\n", nvmet_transport[i].name);
-	}
-
-	return sprintf(page, "\n");
+	return snprintf(page, PAGE_SIZE, "%s\n", port->trtype_name);
 }
 
 static void nvmet_port_init_tsas_rdma(struct nvmet_port *port)
@@ -401,6 +395,8 @@ static ssize_t nvmet_addr_trtype_store(struct config_item *item,
 found:
 	memset(&port->disc_addr.tsas, 0, NVMF_TSAS_SIZE);
 	port->disc_addr.trtype = nvmet_transport[i].type;
+	strscpy(port->trtype_name, nvmet_transport[i].name,
+		sizeof(port->trtype_name));
 	if (port->disc_addr.trtype == NVMF_TRTYPE_RDMA)
 		nvmet_port_init_tsas_rdma(port);
 	else if (port->disc_addr.trtype == NVMF_TRTYPE_TCP)

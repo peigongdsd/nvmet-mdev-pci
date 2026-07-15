@@ -2222,6 +2222,7 @@ static ssize_t nvmet_tcp_host_port_addr(struct nvmet_ctrl *ctrl,
 
 static const struct nvmet_fabrics_ops nvmet_tcp_ops = {
 	.owner			= THIS_MODULE,
+	.name			= "tcp",
 	.type			= NVMF_TRTYPE_TCP,
 	.msdbd			= 1,
 	.add_port		= nvmet_tcp_add_port,
@@ -2274,4 +2275,5 @@ module_exit(nvmet_tcp_exit);
 
 MODULE_DESCRIPTION("NVMe target TCP transport driver");
 MODULE_LICENSE("GPL v2");
+MODULE_ALIAS("nvmet-transport-tcp");
 MODULE_ALIAS("nvmet-transport-3"); /* 3 == NVMF_TRTYPE_TCP */

@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 
 #include "nvmet.h"
+#include "pci-common.h"
 
 static LIST_HEAD(nvmet_pci_epf_ports);
 static DEFINE_MUTEX(nvmet_pci_epf_ports_mutex);
@@ -1526,6 +1527,7 @@ static u16 nvmet_pci_epf_set_feat(const struct nvmet_ctrl *tctrl,
 
 static const struct nvmet_fabrics_ops nvmet_pci_epf_fabrics_ops = {
 	.owner		= THIS_MODULE,
+	.name		= "pci",
 	.type		= NVMF_TRTYPE_PCI,
 	.add_port	= nvmet_pci_epf_add_port,
 	.remove_port	= nvmet_pci_epf_remove_port,
@@ -1687,9 +1689,7 @@ static int nvmet_pci_epf_process_sq(struct nvmet_pci_epf_ctrl *ctrl,
 			sq->qid, head, sq->tail,
 			nvmet_pci_epf_iod_name(iod));
 
-		head++;
-		if (head == sq->depth)
-			head = 0;
+		nvmet_pci_advance_sq_head(&head, sq->depth);
 		WRITE_ONCE(sq->head, head);
 		n++;
 
@@ -1765,7 +1765,7 @@ static void nvmet_pci_epf_cq_work(struct work_struct *work)
 
 		/* Check that the CQ is not full. */
 		cq->head = nvmet_pci_epf_bar_read32(ctrl, cq->db);
-		if (cq->head == cq->tail + 1) {
+		if (nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
 			ret = -EAGAIN;
 			break;
 		}
@@ -1788,10 +1788,9 @@ static void nvmet_pci_epf_cq_work(struct work_struct *work)
 		 * initialize it here.
 		 */
 		cqe = &iod->cqe;
-		cqe->sq_head = cpu_to_le16(READ_ONCE(iod->sq->head));
-		cqe->sq_id = cpu_to_le16(iod->sq->qid);
-		cqe->command_id = iod->cmd.common.command_id;
-		cqe->status = cpu_to_le16((iod->status << 1) | cq->phase);
+		nvmet_pci_prepare_cqe(cqe, READ_ONCE(iod->sq->head),
+				      iod->sq->qid, iod->cmd.common.command_id,
+				      iod->status, cq->phase);
 
 		dev_dbg(ctrl->dev,
 			"CQ[%u]: %s status 0x%x, result 0x%llx, head %u, tail %u, phase %u\n",
@@ -1802,11 +1801,7 @@ static void nvmet_pci_epf_cq_work(struct work_struct *work)
 		memcpy_toio(cq->pci_map.virt_addr + cq->tail * cq->qes,
 			    cqe, cq->qes);
 
-		cq->tail++;
-		if (cq->tail >= cq->depth) {
-			cq->tail = 0;
-			cq->phase ^= 1;
-		}
+		nvmet_pci_advance_cq_tail(&cq->tail, &cq->phase, cq->depth);
 
 		nvmet_pci_epf_free_iod(iod);
 
@@ -1845,14 +1840,25 @@ static void nvmet_pci_epf_clear_ctrl_config(struct nvmet_pci_epf_ctrl *ctrl)
 
 static int nvmet_pci_epf_enable_ctrl(struct nvmet_pci_epf_ctrl *ctrl)
 {
-	u64 pci_addr, asq, acq;
+	struct nvmet_pci_admin_config admin;
 	u32 aqa;
-	u16 status, qsize;
+	u64 asq, acq;
+	u16 status;
+	int ret;
 
 	if (ctrl->enabled)
 		return 0;
 
 	dev_info(ctrl->dev, "Enabling controller\n");
+	aqa = nvmet_pci_epf_bar_read32(ctrl, NVME_REG_AQA);
+	asq = nvmet_pci_epf_bar_read64(ctrl, NVME_REG_ASQ);
+	acq = nvmet_pci_epf_bar_read64(ctrl, NVME_REG_ACQ);
+	ret = nvmet_pci_parse_admin_config(ctrl->cap, ctrl->cc, aqa, asq, acq,
+					   &admin);
+	if (ret) {
+		dev_err(ctrl->dev, "Invalid controller or admin queue configuration\n");
+		goto err;
+	}
 
 	ctrl->mps_shift = nvmet_cc_mps(ctrl->cc) + 12;
 	ctrl->mps = 1UL << ctrl->mps_shift;
@@ -1873,24 +1879,17 @@ static int nvmet_pci_epf_enable_ctrl(struct nvmet_pci_epf_ctrl *ctrl)
 	}
 
 	/* Create the admin queue. */
-	aqa = nvmet_pci_epf_bar_read32(ctrl, NVME_REG_AQA);
-	asq = nvmet_pci_epf_bar_read64(ctrl, NVME_REG_ASQ);
-	acq = nvmet_pci_epf_bar_read64(ctrl, NVME_REG_ACQ);
-
-	qsize = (aqa & 0x0fff0000) >> 16;
-	pci_addr = acq & GENMASK_ULL(63, 12);
 	status = nvmet_pci_epf_create_cq(ctrl->tctrl, 0,
 				NVME_CQ_IRQ_ENABLED | NVME_QUEUE_PHYS_CONTIG,
-				qsize, pci_addr, 0);
+				admin.cq_depth - 1, admin.acq, 0);
 	if (status != NVME_SC_SUCCESS) {
 		dev_err(ctrl->dev, "Failed to create admin completion queue\n");
 		goto err;
 	}
 
-	qsize = aqa & 0x00000fff;
-	pci_addr = asq & GENMASK_ULL(63, 12);
 	status = nvmet_pci_epf_create_sq(ctrl->tctrl, 0, 0,
-			NVME_QUEUE_PHYS_CONTIG, qsize, pci_addr);
+			NVME_QUEUE_PHYS_CONTIG, admin.sq_depth - 1,
+			admin.asq);
 	if (status != NVME_SC_SUCCESS) {
 		dev_err(ctrl->dev, "Failed to create admin submission queue\n");
 		nvmet_pci_epf_delete_cq(ctrl->tctrl, 0);
@@ -2646,3 +2645,4 @@ module_exit(nvmet_pci_epf_cleanup_module);
 MODULE_DESCRIPTION("NVMe PCI Endpoint Function target driver");
 MODULE_AUTHOR("Damien Le Moal <dlemoal@kernel.org>");
 MODULE_LICENSE("GPL");
+MODULE_ALIAS("nvmet-transport-pci");
