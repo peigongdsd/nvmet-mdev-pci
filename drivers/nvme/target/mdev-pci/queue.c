@@ -1032,7 +1032,6 @@ u16 nvmet_mdev_create_sq(struct nvmet_ctrl *tctrl, u16 sqid, u16 cqid,
 			 u16 flags, u16 qsize, u64 prp1)
 {
 	struct nvmet_mdev_ctrl *ctrl = rcu_access_pointer(tctrl->drvdata);
-	struct nvmet_mdev_irq_vector *irq;
 	u16 status;
 
 	if (!ctrl)
@@ -1089,6 +1088,7 @@ u16 nvmet_mdev_get_feature(const struct nvmet_ctrl *tctrl, u8 feature,
 			   void *data)
 {
 	struct nvmet_mdev_ctrl *ctrl = rcu_access_pointer(tctrl->drvdata);
+	struct nvmet_mdev_irq_vector *irq;
 	struct nvmet_feat_irq_coalesce *irqc;
 	struct nvmet_feat_irq_config *irqcfg;
 
