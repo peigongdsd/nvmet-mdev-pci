@@ -136,3 +136,32 @@ config NVME_TARGET_PCI_EPF
 	  capable PCI controller.
 
 	  If unsure, say N.
+
+config NVME_TARGET_MDEV_PCI
+	tristate "NVMe mediated VFIO PCI target support"
+	depends on NVME_TARGET && VFIO
+	depends on NVME_CORE=y || NVME_CORE=NVME_TARGET
+	select VFIO_MDEV
+	help
+	  This enables an NVMe PCI target transport that exposes nvmet
+	  controllers as VFIO mediated devices for assignment to virtual
+	  machines.
+
+	  The implementation is under development. It registers an mdev parent
+	  for each enabled nvmet port and exposes PCI configuration space, NVMe
+	  BAR0 registers and MSI-X through VFIO. The admin queue supports PRP
+	  payloads; I/O queues and admin SGL payloads are not yet implemented.
+
+	  If unsure, say N.
+
+config NVMET_PCI_KUNIT_TEST
+	tristate "KUnit tests for NVMe PCI target helpers"
+	depends on KUNIT && NVME_TARGET
+	default KUNIT_ALL_TESTS
+	help
+	  Run unit tests for the queue wraparound and completion-entry helpers
+	  shared by NVMe PCI target transports. The tests cover wrapped and
+	  non-wrapped queue indices, completion phase changes, completion entry
+	  encoding and admin queue configuration validation.
+
+	  If unsure, say N.

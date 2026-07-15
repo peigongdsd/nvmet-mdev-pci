@@ -210,6 +210,7 @@ struct nvmet_port {
 	struct nvmet_ana_group		ana_default_group;
 	struct key			*keyring;
 	void				*priv;
+	char				trtype_name[32];
 	bool				enabled;
 	int				inline_data_size;
 	int				max_queue_size;
@@ -410,6 +411,7 @@ struct nvmet_subsys_link {
 struct nvmet_req;
 struct nvmet_fabrics_ops {
 	struct module *owner;
+	const char *name;
 	unsigned int type;
 	unsigned int msdbd;
 	unsigned int flags;
@@ -646,6 +648,8 @@ void nvmet_unregister_transport(const struct nvmet_fabrics_ops *ops);
 
 void nvmet_port_del_ctrls(struct nvmet_port *port,
 			  struct nvmet_subsys *subsys);
+int nvmet_port_get_single_subsysnqn(struct nvmet_port *port, char *subsysnqn,
+		size_t subsysnqn_size);
 
 int nvmet_enable_port(struct nvmet_port *port);
 void nvmet_disable_port(struct nvmet_port *port);

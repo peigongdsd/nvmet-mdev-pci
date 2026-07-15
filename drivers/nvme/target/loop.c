@@ -671,6 +671,7 @@ static void nvme_loop_remove_port(struct nvmet_port *port)
 
 static const struct nvmet_fabrics_ops nvme_loop_ops = {
 	.owner		= THIS_MODULE,
+	.name		= "loop",
 	.type		= NVMF_TRTYPE_LOOP,
 	.add_port	= nvme_loop_add_port,
 	.remove_port	= nvme_loop_remove_port,
@@ -720,4 +721,5 @@ module_exit(nvme_loop_cleanup_module);
 
 MODULE_DESCRIPTION("NVMe target loop transport driver");
 MODULE_LICENSE("GPL v2");
+MODULE_ALIAS("nvmet-transport-loop");
 MODULE_ALIAS("nvmet-transport-254"); /* 254 == NVMF_TRTYPE_LOOP */
