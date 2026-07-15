@@ -91,11 +91,17 @@
         shellHook = ''
           export KBUILD_OUTPUT="''${KBUILD_OUTPUT:-$PWD/.build}"
           export CCACHE_DIR="''${CCACHE_DIR:-$PWD/.cache/ccache}"
+          export CCACHE_BASEDIR="''${CCACHE_BASEDIR:-$PWD}"
+          export CCACHE_COMPILERCHECK="''${CCACHE_COMPILERCHECK:-content}"
+          export CCACHE_NOHASHDIR="''${CCACHE_NOHASHDIR:-true}"
+          export CC="''${KBUILD_CC:-ccache gcc}"
+          export HOSTCC="''${KBUILD_HOSTCC:-ccache gcc}"
           mkdir -p "$KBUILD_OUTPUT" "$CCACHE_DIR"
 
           echo "nvmet-mdev-pci kernel development shell"
           echo "  source:  $PWD"
           echo "  output:  $KBUILD_OUTPUT"
+          echo "  ccache:  $CCACHE_DIR"
           echo "  prepare: make defconfig"
           echo "  target:  make -j$(nproc) drivers/nvme/target/"
         '';

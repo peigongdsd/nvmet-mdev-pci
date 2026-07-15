@@ -11,8 +11,12 @@ PCI endpoint and mediated PCI implementations can coexist.
 nix develop path:.
 ```
 
-The shell sets `KBUILD_OUTPUT=$PWD/.build`. Generated kernel files stay out of
-the source tree.
+The shell sets `KBUILD_OUTPUT=$PWD/.build` and configures ccache under
+`$PWD/.cache/ccache`. Generated kernel files stay out of the source tree, and
+both object files and compiler-cache entries survive leaving the shell.
+Set `KBUILD_CC` or `KBUILD_HOSTCC` before entering the shell to replace the
+default `ccache gcc` commands. `LLVM=1` on a make invocation still selects the
+kernel's Clang toolchain.
 
 ## Configure and build
 
@@ -29,6 +33,37 @@ scripts/config --file "$KBUILD_OUTPUT/.config" --module NVMET_PCI_KUNIT_TEST
 make olddefconfig
 make -j"$(nproc)" drivers/nvme/target/
 ```
+
+## Fast inner loop
+
+Do not use the NixOS build for every source edit. Keep `.build` and compile the
+smallest affected target first:
+
+```sh
+nix develop path:. --command \
+  make -j"$(nproc)" drivers/nvme/target/
+nix develop path:. --command ccache --show-stats
+```
+
+Kbuild recompiles only objects whose inputs changed. Ccache also avoids
+recompiling an object after switching revisions and returning to equivalent
+source. Do not run `make clean` or delete `.build`/`.cache/ccache` during normal
+development.
+
+The NixOS kernel derivation remains sandboxed and reproducible, so it cannot
+reuse `.build` directly. Any source change gives that derivation a new source
+hash and causes one clean kernel build. Reserve that build for a runtime test
+checkpoint:
+
+```sh
+nix build \
+  /persistent/nixos#nixosConfigurations.KruslPC.config.system.build.toplevel \
+  --no-link
+run0 nixos-rebuild boot --flake /persistent/nixos#KruslPC
+```
+
+The second command reuses the completed system closure; it should only install
+the boot generation. Reboot before testing changes to nvmet core.
 
 `BLK_DEV_NVME` selects the promptless `NVME_CORE` symbol required by the PCI
 target transports. `NVME_TARGET_MDEV_PCI` similarly selects `VFIO_MDEV`.
