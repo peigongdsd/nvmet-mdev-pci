@@ -87,4 +87,5 @@ const struct nvmet_fabrics_ops nvmet_mdev_fabrics_ops = {
 	.delete_cq	= nvmet_mdev_delete_cq,
 	.get_feature	= nvmet_mdev_get_feature,
 	.set_feature	= nvmet_mdev_set_feature,
+	.set_dbbuf	= nvmet_mdev_set_dbbuf,
 };

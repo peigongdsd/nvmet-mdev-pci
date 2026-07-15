@@ -30,6 +30,8 @@ static int nvmet_mdev_init_dev(struct vfio_device *vdev)
 	ctrl->mport = mport;
 	mutex_init(&ctrl->lock);
 	INIT_LIST_HEAD(&ctrl->mappings);
+	INIT_LIST_HEAD(&ctrl->payloads);
+	nvmet_mdev_irq_init(ctrl);
 	mutex_lock(&ctrl->lock);
 	ret = nvmet_mdev_pci_init(ctrl);
 	mutex_unlock(&ctrl->lock);
@@ -58,6 +60,7 @@ static void nvmet_mdev_release_dev(struct vfio_device *vdev)
 	nvmet_mdev_queue_cleanup(ctrl);
 	nvmet_mdev_ctrl_cleanup(ctrl);
 	WARN_ON(!list_empty(&ctrl->mappings));
+	WARN_ON(!list_empty(&ctrl->payloads));
 	nvmet_mdev_irq_cleanup(ctrl);
 	nvmet_mdev_pci_cleanup(ctrl);
 }
@@ -223,8 +226,8 @@ static void nvmet_mdev_close(struct vfio_device *vdev)
 	nvmet_mdev_disable_ctrl(ctrl, 0);
 	mutex_lock(&ctrl->lock);
 	nvmet_mdev_unmap_all(ctrl);
-	nvmet_mdev_irq_cleanup(ctrl);
 	mutex_unlock(&ctrl->lock);
+	nvmet_mdev_irq_cleanup(ctrl);
 }
 
 static void nvmet_mdev_vfio_dma_unmap(struct vfio_device *vdev, u64 iova,
@@ -257,6 +260,31 @@ static ssize_t nvmet_mdev_show_description(struct mdev_type *mtype, char *buf)
 	return sysfs_emit(buf, "NVMe PCI controller backed by nvmet\n");
 }
 
+static ssize_t transport_stats_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct nvmet_mdev_ctrl *ctrl = dev_get_drvdata(dev);
+
+	if (!ctrl)
+		return -ENODEV;
+	return sysfs_emit(buf,
+		"commands %lld\nbytes_pinned %lld\ncompletions %lld\n"
+		"interrupts %lld\ndoorbell_kicks %lld\npoll_scans %lld\n",
+		atomic64_read(&ctrl->stats.commands),
+		atomic64_read(&ctrl->stats.bytes_pinned),
+		atomic64_read(&ctrl->stats.completions),
+		atomic64_read(&ctrl->stats.interrupts),
+		atomic64_read(&ctrl->stats.doorbell_kicks),
+		atomic64_read(&ctrl->stats.poll_scans));
+}
+static DEVICE_ATTR_RO(transport_stats);
+
+static struct attribute *nvmet_mdev_attrs[] = {
+	&dev_attr_transport_stats.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(nvmet_mdev);
+
 static struct mdev_driver nvmet_mdev_vfio_driver = {
 	.device_api = VFIO_DEVICE_API_PCI_STRING,
 	.max_instances = 1,
@@ -264,6 +292,7 @@ static struct mdev_driver nvmet_mdev_vfio_driver = {
 		.name = "nvmet-mdev-pci",
 		.owner = THIS_MODULE,
 		.mod_name = KBUILD_MODNAME,
+		.dev_groups = nvmet_mdev_groups,
 	},
 	.probe = nvmet_mdev_probe,
 	.remove = nvmet_mdev_remove,

@@ -13,6 +13,26 @@ static void nvmet_pci_cq_full_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, nvmet_pci_cq_full(7, 3, 8));
 }
 
+static void nvmet_pci_prp_helpers_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, nvmet_pci_prp2_valid(0x2000, SZ_4K));
+	KUNIT_EXPECT_FALSE(test, nvmet_pci_prp2_valid(0x2100, SZ_4K));
+	KUNIT_EXPECT_TRUE(test, nvmet_pci_prp2_valid(0x2100, SZ_8K));
+	KUNIT_EXPECT_FALSE(test, nvmet_pci_prp2_valid(0x2104, SZ_8K));
+	KUNIT_EXPECT_EQ(test, nvmet_pci_prp_list_bytes(SZ_8K, 512),
+			(size_t)(2 * sizeof(__le64)));
+	KUNIT_EXPECT_EQ(test, nvmet_pci_prp_list_bytes(SZ_4M, 512),
+			(size_t)SZ_4K);
+}
+
+static void nvmet_pci_dbbuf_event_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, nvmet_pci_dbbuf_need_event(10, 11, 10));
+	KUNIT_EXPECT_FALSE(test, nvmet_pci_dbbuf_need_event(9, 11, 10));
+	KUNIT_EXPECT_TRUE(test, nvmet_pci_dbbuf_need_event(0xffff, 0, 0xffff));
+	KUNIT_EXPECT_FALSE(test, nvmet_pci_dbbuf_need_event(0xfffe, 0, 0xffff));
+}
+
 static void nvmet_pci_advance_sq_head_test(struct kunit *test)
 {
 	u16 head = 3;
@@ -142,6 +162,8 @@ static void nvmet_pci_admin_config_invalid_test(struct kunit *test)
 
 static struct kunit_case nvmet_pci_common_test_cases[] = {
 	KUNIT_CASE(nvmet_pci_cq_full_test),
+	KUNIT_CASE(nvmet_pci_prp_helpers_test),
+	KUNIT_CASE(nvmet_pci_dbbuf_event_test),
 	KUNIT_CASE(nvmet_pci_advance_sq_head_test),
 	KUNIT_CASE(nvmet_pci_advance_cq_tail_test),
 	KUNIT_CASE(nvmet_pci_prepare_cqe_test),

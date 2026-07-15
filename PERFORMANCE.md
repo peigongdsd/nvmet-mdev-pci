@@ -1,5 +1,21 @@
 # nvmet-mdev-pci performance patch plan
 
+## Implementation status
+
+The performance batch implements the data-path portions of all four series:
+PRP collection, request-lifetime VFIO pins, transport-owned SG tables, DMA
+invalidation drains, explicit IOD references, parallel I/O workers, SQ/CQ
+batching, a mempool, real interrupt coalescing, generic nvmet Doorbell Buffer
+Config support, pinned shadow/event arrays and adaptive polling. The original
+copy path remains available through the `pinned_io` module parameter.
+
+Measurement uses per-mdev `transport_stats` counters rather than debugfs and
+tracepoints in the first batch. This avoids unconditional per-page atomics and
+keeps the instrumentation usable from the benchmark scripts. Full PRP-list and
+event-index behavior has focused KUnit coverage. The remaining acceptance gate
+is a rebuilt-kernel VM run followed by the fio/host-perf matrix; compile success
+alone does not establish runtime correctness or a performance gain.
+
 ## Goals and constraints
 
 The performance work must preserve a normal VFIO/QEMU deployment: no SPDK,
@@ -34,17 +50,16 @@ kernel, module, QEMU and fio versions.
 
 ### Patch 2: add low-overhead transport tracepoints and counters
 
-Instrument commands consumed, bytes copied, payload pages pinned, completions
-posted, IRQs signalled, MMIO doorbell kicks, shadow-doorbell polls and DMA-unmap
-drains. Tracepoints are disabled by default; cumulative counters live in
-debugfs. Do not put unconditional atomics in the per-page loop.
+Instrument commands consumed, payload bytes pinned, completions posted, IRQs
+signalled, MMIO doorbell kicks and shadow-doorbell polls. Cumulative counters
+live in the mdev's `transport_stats` sysfs file and are updated per batch or
+request, not in the per-page or busy-poll loop.
 
 Files:
 
-- `drivers/nvme/target/mdev-pci/trace.h`: transport trace events;
-- `drivers/nvme/target/mdev-pci/debugfs.c`: per-controller snapshots;
-- `drivers/nvme/target/mdev-pci/priv.h`: per-CPU or batched statistics;
-- `drivers/nvme/target/mdev-pci/Makefile`: generated trace translation unit.
+- `drivers/nvme/target/mdev-pci/priv.h`: batched statistics;
+- `drivers/nvme/target/mdev-pci/vfio.c`: `transport_stats` attribute;
+- `tools/testing/nvmet-mdev-pci`: guest fio and host perf collection.
 
 ### Patch 3: separate PRP parsing from payload movement
 

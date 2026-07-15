@@ -18,6 +18,30 @@ bool nvmet_pci_cq_full(u16 head, u16 tail, u16 depth)
 }
 EXPORT_SYMBOL_GPL(nvmet_pci_cq_full);
 
+bool nvmet_pci_prp2_valid(u64 prp2, size_t remaining)
+{
+	if (!prp2)
+		return false;
+	if (remaining <= SZ_4K)
+		return IS_ALIGNED(prp2, SZ_4K);
+	/* Linux may allocate short PRP lists from sub-page DMA pools. */
+	return IS_ALIGNED(prp2, sizeof(__le64));
+}
+EXPORT_SYMBOL_GPL(nvmet_pci_prp2_valid);
+
+size_t nvmet_pci_prp_list_bytes(size_t remaining, unsigned int max_entries)
+{
+	return min_t(size_t, DIV_ROUND_UP(remaining, SZ_4K), max_entries) *
+	       sizeof(__le64);
+}
+EXPORT_SYMBOL_GPL(nvmet_pci_prp_list_bytes);
+
+bool nvmet_pci_dbbuf_need_event(u16 event, u16 value, u16 old)
+{
+	return (u16)(value - event - 1) < (u16)(value - old);
+}
+EXPORT_SYMBOL_GPL(nvmet_pci_dbbuf_need_event);
+
 void nvmet_pci_advance_sq_head(u16 *head, u16 depth)
 {
 	if (++(*head) == depth)
