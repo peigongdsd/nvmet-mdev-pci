@@ -50,7 +50,7 @@ int nvmet_mdev_map_guest(struct nvmet_mdev_ctrl *ctrl, u64 iova,
 			 size_t length, int prot,
 			 struct nvmet_mdev_mapping **mappingp)
 {
-	struct nvmet_mdev_mapping *mapping;
+	struct nvmet_mdev_mapping *mapping, *existing;
 	u64 last, last_page, npages64;
 	unsigned int pinned = 0;
 	int ret;
@@ -78,6 +78,13 @@ int nvmet_mdev_map_guest(struct nvmet_mdev_ctrl *ctrl, u64 iova,
 	mapping->length = (u64)mapping->npages << PAGE_SHIFT;
 	mapping->data_iova = iova;
 	mapping->data_length = length;
+	list_for_each_entry(existing, &ctrl->mappings, entry) {
+		if (nvmet_mdev_ranges_overlap(mapping->iova, mapping->length,
+					      existing->iova, existing->length)) {
+			ret = -EBUSY;
+			goto free_mapping;
+		}
+	}
 	mapping->pages = kvmalloc_array(mapping->npages,
 					sizeof(*mapping->pages), GFP_KERNEL);
 	if (!mapping->pages) {

@@ -30,7 +30,6 @@ static int nvmet_mdev_init_dev(struct vfio_device *vdev)
 	ctrl->mport = mport;
 	mutex_init(&ctrl->lock);
 	INIT_LIST_HEAD(&ctrl->mappings);
-	nvmet_mdev_queue_init(ctrl);
 	mutex_lock(&ctrl->lock);
 	ret = nvmet_mdev_pci_init(ctrl);
 	mutex_unlock(&ctrl->lock);
@@ -38,8 +37,16 @@ static int nvmet_mdev_init_dev(struct vfio_device *vdev)
 		return ret;
 
 	ret = nvmet_mdev_ctrl_init(ctrl);
-	if (ret)
+	if (ret) {
 		nvmet_mdev_pci_cleanup(ctrl);
+		return ret;
+	}
+
+	ret = nvmet_mdev_queue_init(ctrl);
+	if (ret) {
+		nvmet_mdev_ctrl_cleanup(ctrl);
+		nvmet_mdev_pci_cleanup(ctrl);
+	}
 	return ret;
 }
 
@@ -48,6 +55,7 @@ static void nvmet_mdev_release_dev(struct vfio_device *vdev)
 	struct nvmet_mdev_ctrl *ctrl =
 		container_of(vdev, struct nvmet_mdev_ctrl, vdev);
 
+	nvmet_mdev_queue_cleanup(ctrl);
 	nvmet_mdev_ctrl_cleanup(ctrl);
 	WARN_ON(!list_empty(&ctrl->mappings));
 	nvmet_mdev_irq_cleanup(ctrl);

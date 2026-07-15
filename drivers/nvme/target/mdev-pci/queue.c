@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/iommu.h>
+#include <linux/overflow.h>
+#include <linux/rcupdate.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -8,12 +10,16 @@
 #include "../pci-common.h"
 #include "priv.h"
 
-#define NVMET_MDEV_ADMIN_MAX_DATA	SZ_1M
+#define NVMET_MDEV_COPY_MAX_DATA	SZ_1M
 #define NVMET_MDEV_PRP_ENTRIES		(SZ_4K / sizeof(__le64))
 
 struct nvmet_mdev_iod {
 	struct list_head entry;
 	struct nvmet_mdev_ctrl *ctrl;
+	struct nvmet_mdev_sq *sq;
+	struct nvmet_mdev_cq *cq;
+	struct work_struct submit_work;
+	struct work_struct response_work;
 	struct nvmet_req req;
 	struct nvme_command cmd;
 	struct nvme_completion cqe;
@@ -64,7 +70,7 @@ static int nvmet_mdev_transfer_prps(struct nvmet_mdev_iod *iod,
 
 	if (!remaining)
 		return 0;
-	if (remaining > NVMET_MDEV_ADMIN_MAX_DATA)
+	if (remaining > NVMET_MDEV_COPY_MAX_DATA)
 		return -E2BIG;
 
 	bounce = kmalloc(SZ_4K, GFP_KERNEL);
@@ -156,13 +162,63 @@ out:
 	return ret;
 }
 
-static void nvmet_mdev_submit_iod(struct nvmet_mdev_iod *iod)
+static void nvmet_mdev_complete_iod(struct nvmet_mdev_iod *iod)
 {
+	struct nvmet_mdev_cq *cq = iod->cq;
+	struct nvmet_mdev_ctrl *ctrl = iod->ctrl;
+
+	mutex_lock(&ctrl->lock);
+	if (!ctrl->enabled || !cq->live) {
+		mutex_unlock(&ctrl->lock);
+		nvmet_mdev_free_iod(iod);
+		return;
+	}
+
+	spin_lock(&cq->lock);
+	list_add_tail(&iod->entry, &cq->completions);
+	spin_unlock(&cq->lock);
+	schedule_work(&cq->work);
+	mutex_unlock(&ctrl->lock);
+}
+
+static void nvmet_mdev_response_work(struct work_struct *work)
+{
+	struct nvmet_mdev_iod *iod =
+		container_of(work, struct nvmet_mdev_iod, response_work);
+	struct nvmet_req *req = &iod->req;
+	u16 status = le16_to_cpu(req->cqe->status) >> 1;
+	int ret;
+
+	if (!status && iod->data_len && !iod->host_to_ctrl) {
+		ret = nvmet_mdev_transfer_prps(iod, true);
+		if (ret) {
+			status = NVME_SC_DATA_XFER_ERROR | NVME_STATUS_DNR;
+			req->cqe->status = cpu_to_le16(status << 1);
+		}
+	}
+
+	if (req->sg)
+		nvmet_req_free_sgls(req);
+	nvmet_mdev_complete_iod(iod);
+}
+
+static void nvmet_mdev_submit_work(struct work_struct *work)
+{
+	struct nvmet_mdev_iod *iod =
+		container_of(work, struct nvmet_mdev_iod, submit_work);
 	struct nvmet_req *req = &iod->req;
 	u16 status;
 	int ret;
 
-	if (!nvmet_req_init(req, &iod->ctrl->admin_sq.nvme_sq,
+	mutex_lock(&iod->ctrl->lock);
+	if (!iod->ctrl->enabled || !iod->sq->live) {
+		mutex_unlock(&iod->ctrl->lock);
+		nvmet_mdev_free_iod(iod);
+		return;
+	}
+	mutex_unlock(&iod->ctrl->lock);
+
+	if (!nvmet_req_init(req, &iod->sq->nvme_sq,
 			    &nvmet_mdev_fabrics_ops))
 		return;
 
@@ -172,7 +228,7 @@ static void nvmet_mdev_submit_iod(struct nvmet_mdev_iod *iod)
 		status = NVME_SC_SGL_INVALID_TYPE | NVME_STATUS_DNR;
 		goto complete;
 	}
-	if (iod->data_len > NVMET_MDEV_ADMIN_MAX_DATA) {
+	if (iod->data_len > NVMET_MDEV_COPY_MAX_DATA) {
 		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
 		goto complete;
 	}
@@ -202,9 +258,10 @@ complete:
 
 static void nvmet_mdev_sq_work(struct work_struct *work)
 {
-	struct nvmet_mdev_admin_sq *sq =
-		container_of(work, struct nvmet_mdev_admin_sq, work);
+	struct nvmet_mdev_sq *sq =
+		container_of(work, struct nvmet_mdev_sq, work);
 	struct nvmet_mdev_ctrl *ctrl = sq->ctrl;
+	unsigned int db = NVME_REG_DBS + (sq->qid * 2 * sizeof(u32));
 	unsigned int processed = 0;
 
 	while (processed < sq->depth) {
@@ -217,7 +274,7 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 			return;
 		}
 
-		tail = get_unaligned_le32(ctrl->bar0 + NVME_REG_DBS);
+		tail = get_unaligned_le32(ctrl->bar0 + db);
 		if (tail >= sq->depth) {
 			ctrl->enabled = false;
 			nvmet_mdev_pci_set_fatal(ctrl);
@@ -238,10 +295,14 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 		}
 
 		iod->ctrl = ctrl;
+		iod->sq = sq;
+		iod->cq = sq->cq;
 		iod->req.cmd = &iod->cmd;
 		iod->req.cqe = &iod->cqe;
 		iod->req.port = ctrl->mport->port;
 		INIT_LIST_HEAD(&iod->entry);
+		INIT_WORK(&iod->submit_work, nvmet_mdev_submit_work);
+		INIT_WORK(&iod->response_work, nvmet_mdev_response_work);
 		dma_rmb();
 		memcpy(&iod->cmd,
 		       sq->entries + sq->head * sizeof(struct nvme_command),
@@ -249,16 +310,17 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 		nvmet_pci_advance_sq_head(&sq->head, sq->depth);
 		mutex_unlock(&ctrl->lock);
 
-		nvmet_mdev_submit_iod(iod);
+		queue_work(sq->iod_wq, &iod->submit_work);
 		processed++;
 	}
 }
 
 static void nvmet_mdev_cq_work(struct work_struct *work)
 {
-	struct nvmet_mdev_admin_cq *cq =
-		container_of(work, struct nvmet_mdev_admin_cq, work);
+	struct nvmet_mdev_cq *cq =
+		container_of(work, struct nvmet_mdev_cq, work);
 	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
+	unsigned int db = NVME_REG_DBS + ((cq->qid * 2 + 1) * sizeof(u32));
 	unsigned int completed = 0;
 
 	for (;;) {
@@ -273,7 +335,7 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 			break;
 		}
 
-		head = get_unaligned_le32(ctrl->bar0 + NVME_REG_DBS + sizeof(u32));
+		head = get_unaligned_le32(ctrl->bar0 + db);
 		if (head >= cq->depth) {
 			ctrl->enabled = false;
 			nvmet_mdev_pci_set_fatal(ctrl);
@@ -282,18 +344,18 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 		}
 		cq->head = head;
 
-		spin_lock(&ctrl->completion_lock);
-		if (list_empty(&ctrl->completions) ||
+		spin_lock(&cq->lock);
+		if (list_empty(&cq->completions) ||
 		    nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
-			spin_unlock(&ctrl->completion_lock);
+			spin_unlock(&cq->lock);
 			mutex_unlock(&ctrl->lock);
 			break;
 		}
 
-		iod = list_first_entry(&ctrl->completions,
+		iod = list_first_entry(&cq->completions,
 				       struct nvmet_mdev_iod, entry);
 		list_del_init(&iod->entry);
-		spin_unlock(&ctrl->completion_lock);
+		spin_unlock(&cq->lock);
 
 		cqe = iod->cqe;
 		status = le16_to_cpu(cqe.status) >> 1;
@@ -309,54 +371,26 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 		completed++;
 	}
 
-	if (completed)
-		nvmet_mdev_signal_irq(ctrl, 0);
+	if (completed && cq->irq_enabled)
+		nvmet_mdev_signal_irq(ctrl, cq->vector);
 }
 
 void nvmet_mdev_queue_response(struct nvmet_req *req)
 {
 	struct nvmet_mdev_iod *iod =
 		container_of(req, struct nvmet_mdev_iod, req);
-	struct nvmet_mdev_ctrl *ctrl = iod->ctrl;
-	u16 status = le16_to_cpu(req->cqe->status) >> 1;
-	bool enabled;
-	int ret;
 
-	mutex_lock(&ctrl->lock);
-	enabled = ctrl->enabled && ctrl->admin_cq.live;
-	mutex_unlock(&ctrl->lock);
-	if (enabled && !status && iod->data_len && !iod->host_to_ctrl) {
-		ret = nvmet_mdev_transfer_prps(iod, true);
-		if (ret) {
-			status = NVME_SC_DATA_XFER_ERROR | NVME_STATUS_DNR;
-			req->cqe->status = cpu_to_le16(status << 1);
-		}
-	}
-	if (req->sg)
-		nvmet_req_free_sgls(req);
-
-	mutex_lock(&ctrl->lock);
-	if (!ctrl->enabled || !ctrl->admin_cq.live) {
-		mutex_unlock(&ctrl->lock);
-		kfree(iod);
-		return;
-	}
-
-	spin_lock(&ctrl->completion_lock);
-	list_add_tail(&iod->entry, &ctrl->completions);
-	spin_unlock(&ctrl->completion_lock);
-	schedule_work(&ctrl->admin_cq.work);
-	mutex_unlock(&ctrl->lock);
+	queue_work(iod->sq->iod_wq, &iod->response_work);
 }
 
-static void nvmet_mdev_drain_completions(struct nvmet_mdev_ctrl *ctrl)
+static void nvmet_mdev_drain_completions(struct nvmet_mdev_cq *cq)
 {
 	struct nvmet_mdev_iod *iod, *tmp;
 	LIST_HEAD(completions);
 
-	spin_lock(&ctrl->completion_lock);
-	list_splice_init(&ctrl->completions, &completions);
-	spin_unlock(&ctrl->completion_lock);
+	spin_lock(&cq->lock);
+	list_splice_init(&cq->completions, &completions);
+	spin_unlock(&cq->lock);
 
 	list_for_each_entry_safe(iod, tmp, &completions, entry) {
 		list_del_init(&iod->entry);
@@ -364,121 +398,306 @@ static void nvmet_mdev_drain_completions(struct nvmet_mdev_ctrl *ctrl)
 	}
 }
 
-void nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
+int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 {
+	unsigned int qid;
+
 	mutex_init(&ctrl->state_lock);
-	spin_lock_init(&ctrl->completion_lock);
-	INIT_LIST_HEAD(&ctrl->completions);
-	ctrl->admin_sq.ctrl = ctrl;
-	ctrl->admin_cq.ctrl = ctrl;
-	INIT_WORK(&ctrl->admin_sq.work, nvmet_mdev_sq_work);
-	INIT_WORK(&ctrl->admin_cq.work, nvmet_mdev_cq_work);
+	ctrl->nr_queues = ctrl->tctrl->subsys->max_qid + 1;
+	ctrl->sqs = kcalloc(ctrl->nr_queues, sizeof(*ctrl->sqs), GFP_KERNEL);
+	if (!ctrl->sqs)
+		return -ENOMEM;
+	ctrl->cqs = kcalloc(ctrl->nr_queues, sizeof(*ctrl->cqs), GFP_KERNEL);
+	if (!ctrl->cqs) {
+		kfree(ctrl->sqs);
+		ctrl->sqs = NULL;
+		return -ENOMEM;
+	}
+
+	for (qid = 0; qid < ctrl->nr_queues; qid++) {
+		struct nvmet_mdev_sq *sq = &ctrl->sqs[qid];
+		struct nvmet_mdev_cq *cq = &ctrl->cqs[qid];
+
+		sq->ctrl = ctrl;
+		sq->qid = qid;
+		INIT_WORK(&sq->work, nvmet_mdev_sq_work);
+		cq->ctrl = ctrl;
+		cq->qid = qid;
+		spin_lock_init(&cq->lock);
+		INIT_LIST_HEAD(&cq->completions);
+		INIT_WORK(&cq->work, nvmet_mdev_cq_work);
+	}
+
+	return 0;
+}
+
+static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
+				       u16 flags, u16 depth, u64 prp1,
+				       u16 vector)
+{
+	struct nvmet_mdev_cq *cq;
+	size_t size;
+	u16 status;
+	int ret;
+
+	lockdep_assert_held(&ctrl->state_lock);
+	if (qid >= ctrl->nr_queues)
+		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+	if (!(flags & NVME_QUEUE_PHYS_CONTIG) || !IS_ALIGNED(prp1, SZ_4K))
+		return NVME_SC_INVALID_QUEUE | NVME_STATUS_DNR;
+	if ((flags & NVME_CQ_IRQ_ENABLED) &&
+	    vector >= NVMET_MDEV_PCI_MSIX_VECTORS)
+		return NVME_SC_INVALID_VECTOR | NVME_STATUS_DNR;
+	if (check_mul_overflow((size_t)depth, sizeof(struct nvme_completion),
+			       &size))
+		return NVME_SC_QUEUE_SIZE | NVME_STATUS_DNR;
+
+	cq = &ctrl->cqs[qid];
+	mutex_lock(&ctrl->lock);
+	if (cq->live) {
+		status = NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+		goto out_unlock;
+	}
+
+	ret = nvmet_mdev_map_guest(ctrl, prp1, size, IOMMU_WRITE,
+				   &cq->mapping);
+	if (ret) {
+		status = NVME_SC_DATA_XFER_ERROR | NVME_STATUS_DNR;
+		goto out_unlock;
+	}
+	cq->entries = nvmet_mdev_mapping_addr(cq->mapping);
+	cq->depth = depth;
+	cq->head = 0;
+	cq->tail = 0;
+	cq->phase = 1;
+	cq->vector = vector;
+	cq->irq_enabled = flags & NVME_CQ_IRQ_ENABLED;
+	put_unaligned_le32(0, ctrl->bar0 + NVME_REG_DBS +
+			   ((qid * 2 + 1) * sizeof(u32)));
+
+	status = nvmet_cq_create(ctrl->tctrl, &cq->nvme_cq, qid, depth);
+	if (status != NVME_SC_SUCCESS) {
+		nvmet_mdev_unmap_guest(ctrl, cq->mapping);
+		cq->mapping = NULL;
+		cq->entries = NULL;
+		cq->depth = 0;
+		goto out_unlock;
+	}
+	cq->live = true;
+
+out_unlock:
+	mutex_unlock(&ctrl->lock);
+	return status;
+}
+
+static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
+				       u16 cqid, u16 flags, u16 depth,
+				       u64 prp1)
+{
+	struct nvmet_mdev_sq *sq;
+	struct nvmet_mdev_cq *cq;
+	struct workqueue_struct *iod_wq;
+	size_t size;
+	u16 status;
+	int ret;
+
+	lockdep_assert_held(&ctrl->state_lock);
+	if (qid >= ctrl->nr_queues || cqid >= ctrl->nr_queues)
+		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+	if (!(flags & NVME_QUEUE_PHYS_CONTIG) || !IS_ALIGNED(prp1, SZ_4K))
+		return NVME_SC_INVALID_QUEUE | NVME_STATUS_DNR;
+	if (check_mul_overflow((size_t)depth, sizeof(struct nvme_command),
+			       &size))
+		return NVME_SC_QUEUE_SIZE | NVME_STATUS_DNR;
+
+	sq = &ctrl->sqs[qid];
+	cq = &ctrl->cqs[cqid];
+	/* nvmet may complete inline; serialize submit and response ownership. */
+	iod_wq = alloc_ordered_workqueue("nvmet_mdev_sq%u", WQ_MEM_RECLAIM,
+					 qid);
+	if (!iod_wq)
+		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
+
+	mutex_lock(&ctrl->lock);
+	if (sq->live || !cq->live) {
+		status = NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+		goto out_destroy_wq;
+	}
+
+	ret = nvmet_mdev_map_guest(ctrl, prp1, size, IOMMU_READ,
+				   &sq->mapping);
+	if (ret) {
+		status = NVME_SC_DATA_XFER_ERROR | NVME_STATUS_DNR;
+		goto out_destroy_wq;
+	}
+	sq->entries = nvmet_mdev_mapping_addr(sq->mapping);
+	sq->depth = depth;
+	sq->head = 0;
+	sq->cq = cq;
+	sq->iod_wq = iod_wq;
+	put_unaligned_le32(0, ctrl->bar0 + NVME_REG_DBS +
+			   (qid * 2 * sizeof(u32)));
+
+	status = nvmet_sq_create(ctrl->tctrl, &sq->nvme_sq, &cq->nvme_cq,
+				 qid, depth);
+	if (status != NVME_SC_SUCCESS) {
+		nvmet_mdev_unmap_guest(ctrl, sq->mapping);
+		sq->mapping = NULL;
+		sq->entries = NULL;
+		sq->depth = 0;
+		sq->cq = NULL;
+		sq->iod_wq = NULL;
+		goto out_destroy_wq;
+	}
+	sq->live = true;
+	mutex_unlock(&ctrl->lock);
+	return NVME_SC_SUCCESS;
+
+out_destroy_wq:
+	mutex_unlock(&ctrl->lock);
+	destroy_workqueue(iod_wq);
+	return status;
+}
+
+static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
+{
+	struct workqueue_struct *iod_wq;
+	struct nvmet_mdev_sq *sq;
+
+	lockdep_assert_held(&ctrl->state_lock);
+	if (qid >= ctrl->nr_queues)
+		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+
+	sq = &ctrl->sqs[qid];
+	mutex_lock(&ctrl->lock);
+	if (!sq->live) {
+		mutex_unlock(&ctrl->lock);
+		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+	}
+	sq->live = false;
+	iod_wq = sq->iod_wq;
+	mutex_unlock(&ctrl->lock);
+
+	cancel_work_sync(&sq->work);
+	flush_workqueue(iod_wq);
+	nvmet_sq_destroy(&sq->nvme_sq);
+	destroy_workqueue(iod_wq);
+
+	mutex_lock(&ctrl->lock);
+	if (sq->mapping)
+		nvmet_mdev_unmap_guest(ctrl, sq->mapping);
+	sq->mapping = NULL;
+	sq->entries = NULL;
+	sq->iod_wq = NULL;
+	sq->cq = NULL;
+	sq->depth = 0;
+	sq->head = 0;
+	mutex_unlock(&ctrl->lock);
+	return NVME_SC_SUCCESS;
+}
+
+static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
+{
+	struct nvmet_mdev_cq *cq;
+
+	lockdep_assert_held(&ctrl->state_lock);
+	if (qid >= ctrl->nr_queues)
+		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+
+	cq = &ctrl->cqs[qid];
+	mutex_lock(&ctrl->lock);
+	if (!cq->live) {
+		mutex_unlock(&ctrl->lock);
+		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+	}
+	cq->live = false;
+	mutex_unlock(&ctrl->lock);
+
+	cancel_work_sync(&cq->work);
+	nvmet_mdev_drain_completions(cq);
+	nvmet_cq_put(&cq->nvme_cq);
+
+	mutex_lock(&ctrl->lock);
+	if (cq->mapping)
+		nvmet_mdev_unmap_guest(ctrl, cq->mapping);
+	cq->mapping = NULL;
+	cq->entries = NULL;
+	cq->depth = 0;
+	cq->head = 0;
+	cq->tail = 0;
+	cq->phase = 1;
+	cq->vector = 0;
+	cq->irq_enabled = false;
+	mutex_unlock(&ctrl->lock);
+	return NVME_SC_SUCCESS;
 }
 
 static void __nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 {
-	struct nvmet_mdev_admin_sq *sq = &ctrl->admin_sq;
-	struct nvmet_mdev_admin_cq *cq = &ctrl->admin_cq;
+	unsigned int qid;
 
+	lockdep_assert_held(&ctrl->state_lock);
 	mutex_lock(&ctrl->lock);
 	ctrl->enabled = false;
 	mutex_unlock(&ctrl->lock);
 
-	cancel_work_sync(&sq->work);
-	if (sq->live) {
-		nvmet_sq_destroy(&sq->nvme_sq);
-		sq->live = false;
-	}
-	cancel_work_sync(&cq->work);
-	nvmet_mdev_drain_completions(ctrl);
-	if (cq->live) {
-		nvmet_cq_put(&cq->nvme_cq);
-		cq->live = false;
-	}
+	for (qid = ctrl->nr_queues; qid-- > 0;)
+		if (ctrl->sqs[qid].live)
+			nvmet_mdev_delete_sq_locked(ctrl, qid);
+	for (qid = ctrl->nr_queues; qid-- > 0;)
+		if (ctrl->cqs[qid].live)
+			nvmet_mdev_delete_cq_locked(ctrl, qid);
 
+	if (!ctrl->tctrl)
+		return;
+	nvmet_update_cc(ctrl->tctrl, cc);
 	mutex_lock(&ctrl->lock);
-	if (sq->mapping) {
-		nvmet_mdev_unmap_guest(ctrl, sq->mapping);
-		sq->mapping = NULL;
-	}
-	if (cq->mapping) {
-		nvmet_mdev_unmap_guest(ctrl, cq->mapping);
-		cq->mapping = NULL;
-	}
-	sq->entries = NULL;
-	cq->entries = NULL;
-	sq->depth = 0;
-	cq->depth = 0;
+	put_unaligned_le32(ctrl->tctrl->csts, ctrl->bar0 + NVME_REG_CSTS);
 	mutex_unlock(&ctrl->lock);
-
-	if (ctrl->tctrl) {
-		nvmet_update_cc(ctrl->tctrl, cc);
-		mutex_lock(&ctrl->lock);
-		put_unaligned_le32(ctrl->tctrl->csts,
-				   ctrl->bar0 + NVME_REG_CSTS);
-		mutex_unlock(&ctrl->lock);
-	}
 }
 
 int nvmet_mdev_enable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 {
-	struct nvmet_mdev_admin_sq *sq = &ctrl->admin_sq;
-	struct nvmet_mdev_admin_cq *cq = &ctrl->admin_cq;
 	struct nvmet_pci_admin_config admin;
 	u16 status;
 	u64 cap, asq, acq;
 	u32 aqa;
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&ctrl->state_lock);
 	mutex_lock(&ctrl->lock);
 	if (ctrl->enabled) {
 		mutex_unlock(&ctrl->lock);
-		mutex_unlock(&ctrl->state_lock);
-		return 0;
+		goto out_unlock_state;
 	}
-
 	cap = get_unaligned_le64(ctrl->bar0 + NVME_REG_CAP);
 	aqa = get_unaligned_le32(ctrl->bar0 + NVME_REG_AQA);
 	asq = get_unaligned_le64(ctrl->bar0 + NVME_REG_ASQ);
 	acq = get_unaligned_le64(ctrl->bar0 + NVME_REG_ACQ);
-	ret = nvmet_pci_parse_admin_config(cap, cc, aqa, asq, acq, &admin);
-	if (ret)
-		goto fail_unlock;
-
-	ret = nvmet_mdev_map_guest(ctrl, admin.acq, admin.cq_size,
-				   IOMMU_WRITE, &cq->mapping);
-	if (ret)
-		goto fail_unlock;
-	cq->entries = nvmet_mdev_mapping_addr(cq->mapping);
-	cq->depth = admin.cq_depth;
-	cq->head = 0;
-	cq->tail = 0;
-	cq->phase = 1;
-	status = nvmet_cq_create(ctrl->tctrl, &cq->nvme_cq, 0, cq->depth);
-	if (status != NVME_SC_SUCCESS) {
-		ret = -EINVAL;
-		goto fail_unlock;
-	}
-	cq->live = true;
-
-	ret = nvmet_mdev_map_guest(ctrl, admin.asq, admin.sq_size,
-				   IOMMU_READ, &sq->mapping);
-	if (ret)
-		goto fail_unlock;
-	sq->entries = nvmet_mdev_mapping_addr(sq->mapping);
-	sq->depth = admin.sq_depth;
-	sq->head = 0;
-	status = nvmet_sq_create(ctrl->tctrl, &sq->nvme_sq, &cq->nvme_cq,
-				 0, sq->depth);
-	if (status != NVME_SC_SUCCESS) {
-		ret = -EINVAL;
-		goto fail_unlock;
-	}
-	sq->live = true;
-	ctrl->enabled = true;
 	mutex_unlock(&ctrl->lock);
 
+	ret = nvmet_pci_parse_admin_config(cap, cc, aqa, asq, acq, &admin);
+	if (ret)
+		goto fail;
+	status = nvmet_mdev_create_cq_locked(ctrl, 0,
+					     NVME_QUEUE_PHYS_CONTIG |
+					     NVME_CQ_IRQ_ENABLED,
+					     admin.cq_depth, admin.acq, 0);
+	if (status != NVME_SC_SUCCESS) {
+		ret = -EINVAL;
+		goto fail;
+	}
+	status = nvmet_mdev_create_sq_locked(ctrl, 0, 0,
+					     NVME_QUEUE_PHYS_CONTIG,
+					     admin.sq_depth, admin.asq);
+	if (status != NVME_SC_SUCCESS) {
+		ret = -EINVAL;
+		goto fail;
+	}
+
+	mutex_lock(&ctrl->lock);
+	ctrl->enabled = true;
+	mutex_unlock(&ctrl->lock);
 	nvmet_update_cc(ctrl->tctrl, cc);
 	mutex_lock(&ctrl->lock);
 	put_unaligned_le32(ctrl->tctrl->csts, ctrl->bar0 + NVME_REG_CSTS);
@@ -488,17 +707,15 @@ int nvmet_mdev_enable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	}
 	mutex_unlock(&ctrl->lock);
 	if (ret)
-		__nvmet_mdev_disable_ctrl(ctrl, 0);
-	mutex_unlock(&ctrl->state_lock);
-	return ret;
+		goto fail;
+	goto out_unlock_state;
 
-fail_unlock:
-	nvmet_mdev_pci_set_fatal(ctrl);
-	mutex_unlock(&ctrl->lock);
+fail:
 	__nvmet_mdev_disable_ctrl(ctrl, 0);
 	mutex_lock(&ctrl->lock);
 	nvmet_mdev_pci_set_fatal(ctrl);
 	mutex_unlock(&ctrl->lock);
+out_unlock_state:
 	mutex_unlock(&ctrl->state_lock);
 	return ret;
 }
@@ -510,41 +727,91 @@ void nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	mutex_unlock(&ctrl->state_lock);
 }
 
-void nvmet_mdev_schedule_sq(struct nvmet_mdev_ctrl *ctrl)
+void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 {
-	schedule_work(&ctrl->admin_sq.work);
+	nvmet_mdev_disable_ctrl(ctrl, 0);
+	kfree(ctrl->cqs);
+	ctrl->cqs = NULL;
+	kfree(ctrl->sqs);
+	ctrl->sqs = NULL;
+	ctrl->nr_queues = 0;
 }
 
-void nvmet_mdev_schedule_cq(struct nvmet_mdev_ctrl *ctrl)
+void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
+				  bool cq)
 {
-	schedule_work(&ctrl->admin_cq.work);
+	mutex_lock(&ctrl->lock);
+	if (!ctrl->enabled || qid >= ctrl->nr_queues)
+		goto out_unlock;
+	if (cq) {
+		if (ctrl->cqs[qid].live)
+			schedule_work(&ctrl->cqs[qid].work);
+	} else if (ctrl->sqs[qid].live) {
+		schedule_work(&ctrl->sqs[qid].work);
+	}
+out_unlock:
+	mutex_unlock(&ctrl->lock);
 }
 
 u8 nvmet_mdev_get_mdts(const struct nvmet_ctrl *tctrl)
 {
-	return ilog2(NVMET_MDEV_ADMIN_MAX_DATA) - 12;
+	return ilog2(NVMET_MDEV_COPY_MAX_DATA) - 12;
 }
 
 u16 nvmet_mdev_create_sq(struct nvmet_ctrl *tctrl, u16 sqid, u16 cqid,
 			 u16 flags, u16 qsize, u64 prp1)
 {
-	return NVME_SC_INVALID_QUEUE | NVME_STATUS_DNR;
+	struct nvmet_mdev_ctrl *ctrl = rcu_access_pointer(tctrl->drvdata);
+	u16 status;
+
+	if (!ctrl)
+		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
+	mutex_lock(&ctrl->state_lock);
+	status = nvmet_mdev_create_sq_locked(ctrl, sqid, cqid, flags,
+					     qsize + 1, prp1);
+	mutex_unlock(&ctrl->state_lock);
+	return status;
 }
 
 u16 nvmet_mdev_delete_sq(struct nvmet_ctrl *tctrl, u16 sqid)
 {
-	return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+	struct nvmet_mdev_ctrl *ctrl = rcu_access_pointer(tctrl->drvdata);
+	u16 status;
+
+	if (!ctrl)
+		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
+	mutex_lock(&ctrl->state_lock);
+	status = nvmet_mdev_delete_sq_locked(ctrl, sqid);
+	mutex_unlock(&ctrl->state_lock);
+	return status;
 }
 
 u16 nvmet_mdev_create_cq(struct nvmet_ctrl *tctrl, u16 cqid, u16 flags,
 			 u16 qsize, u64 prp1, u16 irq_vector)
 {
-	return NVME_SC_INVALID_QUEUE | NVME_STATUS_DNR;
+	struct nvmet_mdev_ctrl *ctrl = rcu_access_pointer(tctrl->drvdata);
+	u16 status;
+
+	if (!ctrl)
+		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
+	mutex_lock(&ctrl->state_lock);
+	status = nvmet_mdev_create_cq_locked(ctrl, cqid, flags, qsize + 1,
+					     prp1, irq_vector);
+	mutex_unlock(&ctrl->state_lock);
+	return status;
 }
 
 u16 nvmet_mdev_delete_cq(struct nvmet_ctrl *tctrl, u16 cqid)
 {
-	return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
+	struct nvmet_mdev_ctrl *ctrl = rcu_access_pointer(tctrl->drvdata);
+	u16 status;
+
+	if (!ctrl)
+		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
+	mutex_lock(&ctrl->state_lock);
+	status = nvmet_mdev_delete_cq_locked(ctrl, cqid);
+	mutex_unlock(&ctrl->state_lock);
+	return status;
 }
 
 u16 nvmet_mdev_get_feature(const struct nvmet_ctrl *tctrl, u8 feature,
