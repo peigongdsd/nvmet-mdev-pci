@@ -1758,7 +1758,8 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 	if (args->hostid)
 		uuid_copy(&ctrl->hostid, args->hostid);
 
-	dhchap_status = nvmet_setup_auth(ctrl, args->sq, false);
+	/* PCI transports allocate controllers without a fabrics admin queue. */
+	dhchap_status = args->sq ? nvmet_setup_auth(ctrl, args->sq, false) : 0;
 	if (dhchap_status) {
 		pr_err("Failed to setup authentication, dhchap status %u\n",
 		       dhchap_status);
@@ -1777,8 +1778,9 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 		nvmet_is_disc_subsys(ctrl->subsys) ? "discovery" : "nvm",
 		ctrl->cntlid, ctrl->subsys->subsysnqn, ctrl->hostnqn,
 		ctrl->pi_support ? " T10-PI is enabled" : "",
-		nvmet_has_auth(ctrl, args->sq) ? " with DH-HMAC-CHAP" : "",
-		nvmet_queue_tls_keyid(args->sq) ? ", TLS" : "");
+		args->sq && nvmet_has_auth(ctrl, args->sq) ?
+			" with DH-HMAC-CHAP" : "",
+		args->sq && nvmet_queue_tls_keyid(args->sq) ? ", TLS" : "");
 
 	return ctrl;
 

@@ -49,16 +49,22 @@ repository, which is based on 7.2-rc3 plus the nvmet mdev work.
 
 ## Build and activate
 
-First build without changing the running generation:
+Build the complete machine closure without changing the running generation:
 
 ```sh
-sudo nixos-rebuild build --flake /persistent/nixos#KruslPC
+nix build \
+  /persistent/nixos#nixosConfigurations.KruslPC.config.system.build.toplevel \
+  --no-link
 ```
 
-Then activate it:
+This is the only full Nix build needed for a runtime checkpoint. During normal
+development, use the persistent `.build` Kbuild tree described in
+`DEVELOPING.md`; a clean Nix derivation cannot reuse individual kernel objects.
+
+Then install the already-built closure as the next boot generation:
 
 ```sh
-sudo nixos-rebuild boot --flake /persistent/nixos#KruslPC
+run0 nixos-rebuild boot --flake /persistent/nixos#KruslPC
 sudo reboot
 ```
 
