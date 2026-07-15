@@ -442,6 +442,7 @@ struct nvmet_fabrics_ops {
 			   void *feat_data);
 	u16 (*get_feature)(const struct nvmet_ctrl *ctrl, u8 feat,
 			   void *feat_data);
+	u16 (*set_dbbuf)(struct nvmet_ctrl *ctrl, u64 dbs, u64 eis);
 };
 
 #define NVMET_MAX_INLINE_BIOVEC	8

@@ -4,9 +4,12 @@
 
 #include <linux/device.h>
 #include <linux/eventfd.h>
+#include <linux/hrtimer.h>
 #include <linux/list.h>
 #include <linux/mdev.h>
+#include <linux/mempool.h>
 #include <linux/mutex.h>
+#include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/vfio.h>
@@ -48,7 +51,45 @@ struct nvmet_mdev_mapping {
 	void *vaddr;
 };
 
+struct nvmet_mdev_iova_segment {
+	u64 iova;
+	size_t length;
+};
+
+struct nvmet_mdev_pin_run {
+	u64 iova;
+	unsigned int npages;
+};
+
+struct nvmet_mdev_payload {
+	struct list_head entry;
+	struct sg_table sgt;
+	struct nvmet_mdev_pin_run *runs;
+	unsigned int nr_runs;
+	bool active;
+};
+
+struct nvmet_mdev_stats {
+	atomic64_t commands;
+	atomic64_t bytes_pinned;
+	atomic64_t completions;
+	atomic64_t interrupts;
+	atomic64_t doorbell_kicks;
+	atomic64_t poll_scans;
+};
+
 struct nvmet_mdev_ctrl;
+
+struct nvmet_mdev_irq_vector {
+	struct nvmet_mdev_ctrl *ctrl;
+	struct hrtimer timer;
+	struct work_struct work;
+	/* Protects pending completion count and timer decisions. */
+	spinlock_t lock;
+	unsigned int vector;
+	unsigned int pending;
+	bool coalescing_disabled;
+};
 
 struct nvmet_mdev_cq;
 
@@ -96,12 +137,26 @@ struct nvmet_mdev_ctrl {
 	u8 *config;
 	u8 *bar0;
 	struct eventfd_ctx *irq_ctx[NVMET_MDEV_PCI_MSIX_VECTORS];
+	struct nvmet_mdev_irq_vector irq_vectors[NVMET_MDEV_PCI_MSIX_VECTORS];
+	u8 irq_coalesce_threshold;
+	u8 irq_coalesce_time;
 	struct nvmet_ctrl *tctrl;
 	struct list_head mappings;
+	struct list_head payloads;
 	struct nvmet_mdev_sq *sqs;
 	struct nvmet_mdev_cq *cqs;
+	struct nvmet_mdev_mapping *dbbuf_dbs_mapping;
+	struct nvmet_mdev_mapping *dbbuf_eis_mapping;
+	__le32 *dbbuf_dbs;
+	__le32 *dbbuf_eis;
+	struct delayed_work poll_work;
+	unsigned long poll_busy_until;
+	struct nvmet_mdev_stats stats;
+	mempool_t iod_pool;
 	u16 nr_queues;
+	bool iod_pool_ready;
 	bool enabled;
+	bool dma_blocked;
 };
 
 extern const struct nvmet_fabrics_ops nvmet_mdev_fabrics_ops;
@@ -123,10 +178,14 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 			     loff_t *ppos);
 
 void nvmet_mdev_irq_cleanup(struct nvmet_mdev_ctrl *ctrl);
+void nvmet_mdev_irq_init(struct nvmet_mdev_ctrl *ctrl);
+void nvmet_mdev_irq_quiesce(struct nvmet_mdev_ctrl *ctrl);
 int nvmet_mdev_irq_info(struct vfio_irq_info *info);
 int nvmet_mdev_set_irqs(struct nvmet_mdev_ctrl *ctrl,
 			struct vfio_irq_set *hdr, void *data);
 void nvmet_mdev_signal_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector);
+void nvmet_mdev_notify_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector,
+			   unsigned int completions, bool force);
 void nvmet_mdev_update_pending_irqs(struct nvmet_mdev_ctrl *ctrl);
 
 int nvmet_mdev_map_guest(struct nvmet_mdev_ctrl *ctrl, u64 iova,
@@ -137,11 +196,18 @@ void nvmet_mdev_unmap_guest(struct nvmet_mdev_ctrl *ctrl,
 void nvmet_mdev_unmap_all(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_dma_unmap(struct nvmet_mdev_ctrl *ctrl, u64 iova, u64 length);
 void *nvmet_mdev_mapping_addr(const struct nvmet_mdev_mapping *mapping);
+int nvmet_mdev_pin_payload(struct nvmet_mdev_ctrl *ctrl,
+			   const struct nvmet_mdev_iova_segment *segments,
+			   unsigned int nr_segments, int prot,
+			   struct nvmet_mdev_payload *payload);
+void nvmet_mdev_unpin_payload(struct nvmet_mdev_ctrl *ctrl,
+			      struct nvmet_mdev_payload *payload);
 
 int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl);
 int nvmet_mdev_enable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc);
 void nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc);
+void nvmet_mdev_disable_ctrl_locked(struct nvmet_mdev_ctrl *ctrl, u32 cc);
 void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 				  bool cq);
 void nvmet_mdev_queue_response(struct nvmet_req *req);
@@ -156,6 +222,7 @@ u16 nvmet_mdev_get_feature(const struct nvmet_ctrl *tctrl, u8 feature,
 			   void *data);
 u16 nvmet_mdev_set_feature(const struct nvmet_ctrl *tctrl, u8 feature,
 			   void *data);
+u16 nvmet_mdev_set_dbbuf(struct nvmet_ctrl *tctrl, u64 dbs, u64 eis);
 
 int nvmet_mdev_ctrl_init(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_ctrl_cleanup(struct nvmet_mdev_ctrl *ctrl);

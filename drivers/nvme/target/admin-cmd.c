@@ -367,6 +367,9 @@ static void nvmet_get_cmd_effects_admin(struct nvmet_ctrl *ctrl,
 		log->acs[nvme_admin_delete_cq] =
 		log->acs[nvme_admin_create_cq] =
 			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		if (ctrl->ops->set_dbbuf)
+			log->acs[nvme_admin_dbbuf] =
+				cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
 	}
 
 	log->acs[nvme_admin_get_log_page] =
@@ -699,7 +702,8 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 		ctratt |= NVME_CTRL_ATTR_RHII;
 	id->ctratt = cpu_to_le32(ctratt);
 
-	id->oacs = 0;
+	if (ctrl->ops->set_dbbuf)
+		id->oacs = cpu_to_le16(NVME_CTRL_OACS_DBBUF_SUPP);
 
 	/*
 	 * We don't really have a practical limit on the number of abort
@@ -1607,6 +1611,38 @@ out:
 	nvmet_req_complete(req, status);
 }
 
+static void nvmet_execute_dbbuf(struct nvmet_req *req)
+{
+	struct nvme_dbbuf *cmd = &req->cmd->dbbuf;
+	struct nvmet_ctrl *ctrl = req->sq->ctrl;
+	u64 dbs = le64_to_cpu(cmd->prp1);
+	u64 eis = le64_to_cpu(cmd->prp2);
+	u16 status;
+
+	if (!nvmet_check_transfer_len(req, 0))
+		return;
+	if (!nvmet_is_pci_ctrl(ctrl) || !ctrl->ops->set_dbbuf) {
+		status = NVME_SC_INVALID_OPCODE | NVME_STATUS_DNR;
+		goto complete;
+	}
+	if (cmd->flags || memchr_inv(cmd->rsvd1, 0, sizeof(cmd->rsvd1)) ||
+	    memchr_inv(cmd->rsvd12, 0, sizeof(cmd->rsvd12))) {
+		req->error_loc = offsetof(struct nvme_dbbuf, flags);
+		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
+		goto complete;
+	}
+	if (!dbs || !eis || !IS_ALIGNED(dbs, PAGE_SIZE) ||
+	    !IS_ALIGNED(eis, PAGE_SIZE)) {
+		req->error_loc = offsetof(struct nvme_dbbuf, prp1);
+		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
+		goto complete;
+	}
+
+	status = ctrl->ops->set_dbbuf(ctrl, dbs, eis);
+complete:
+	nvmet_req_complete(req, status);
+}
+
 u32 nvmet_admin_cmd_data_len(struct nvmet_req *req)
 {
 	struct nvme_command *cmd = req->cmd;
@@ -1683,6 +1719,11 @@ u16 nvmet_parse_admin_cmd(struct nvmet_req *req)
 		return 0;
 	case nvme_admin_keep_alive:
 		req->execute = nvmet_execute_keep_alive;
+		return 0;
+	case nvme_admin_dbbuf:
+		if (!req->sq->ctrl->ops->set_dbbuf)
+			return nvmet_report_invalid_opcode(req);
+		req->execute = nvmet_execute_dbbuf;
 		return 0;
 	default:
 		return nvmet_report_invalid_opcode(req);

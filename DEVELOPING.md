@@ -146,8 +146,10 @@ and fetches only the entries required by the command.
 errors as a test failure. A rebuilt-kernel rerun remains required to validate
 the regression fix.
 
-Layer 2 replaces payload copies with request-lifetime page pinning, then adds
-parallel submission, shadow doorbells, completion batching and interrupt
-coalescing. Those changes are performance work and are intentionally separate
-from the functionally complete copy path. See `PERFORMANCE.md` for the ordered
-patch series, safety invariants and measurement gates.
+The Layer 2 batch replaces I/O payload copies with request-lifetime page
+pinning and adds parallel submission, SQ/CQ batching, interrupt coalescing and
+shadow doorbells. Admin payloads retain the simpler copy path, and
+`pinned_io=0` provides an I/O A/B baseline. The batch passes focused compilation
+and KUnit checks but requires a rebuilt-kernel VM smoke run before it can be
+called runtime-complete. See `PERFORMANCE.md` for the safety invariants,
+benchmark matrix and acceptance gates.

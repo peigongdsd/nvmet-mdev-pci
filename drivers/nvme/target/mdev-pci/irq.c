@@ -6,6 +6,47 @@
 
 #include "priv.h"
 
+static void nvmet_mdev_irq_work(struct work_struct *work)
+{
+	struct nvmet_mdev_irq_vector *irq =
+		container_of(work, struct nvmet_mdev_irq_vector, work);
+	bool signal = false;
+
+	spin_lock(&irq->lock);
+	if (irq->pending) {
+		irq->pending = 0;
+		signal = true;
+	}
+	spin_unlock(&irq->lock);
+	if (signal)
+		nvmet_mdev_signal_irq(irq->ctrl, irq->vector);
+}
+
+static enum hrtimer_restart nvmet_mdev_irq_timer(struct hrtimer *timer)
+{
+	struct nvmet_mdev_irq_vector *irq =
+		container_of(timer, struct nvmet_mdev_irq_vector, timer);
+
+	schedule_work(&irq->work);
+	return HRTIMER_NORESTART;
+}
+
+void nvmet_mdev_irq_init(struct nvmet_mdev_ctrl *ctrl)
+{
+	unsigned int vector;
+
+	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++) {
+		struct nvmet_mdev_irq_vector *irq = &ctrl->irq_vectors[vector];
+
+		irq->ctrl = ctrl;
+		irq->vector = vector;
+		spin_lock_init(&irq->lock);
+		INIT_WORK(&irq->work, nvmet_mdev_irq_work);
+		hrtimer_setup(&irq->timer, nvmet_mdev_irq_timer,
+			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	}
+}
+
 static void nvmet_mdev_put_irq_ctx(struct nvmet_mdev_ctrl *ctrl,
 				   unsigned int vector)
 {
@@ -16,10 +57,26 @@ static void nvmet_mdev_put_irq_ctx(struct nvmet_mdev_ctrl *ctrl,
 	ctrl->irq_ctx[vector] = NULL;
 }
 
+void nvmet_mdev_irq_quiesce(struct nvmet_mdev_ctrl *ctrl)
+{
+	unsigned int vector;
+
+	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++) {
+		struct nvmet_mdev_irq_vector *irq = &ctrl->irq_vectors[vector];
+
+		hrtimer_cancel(&ctrl->irq_vectors[vector].timer);
+		cancel_work_sync(&ctrl->irq_vectors[vector].work);
+		spin_lock(&irq->lock);
+		irq->pending = 0;
+		spin_unlock(&irq->lock);
+	}
+}
+
 void nvmet_mdev_irq_cleanup(struct nvmet_mdev_ctrl *ctrl)
 {
 	unsigned int vector;
 
+	nvmet_mdev_irq_quiesce(ctrl);
 	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++)
 		nvmet_mdev_put_irq_ctx(ctrl, vector);
 }
@@ -152,12 +209,52 @@ void nvmet_mdev_signal_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector)
 	if ((flags & PCI_MSIX_FLAGS_ENABLE) &&
 	    !(flags & PCI_MSIX_FLAGS_MASKALL) &&
 	    !(vector_ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT) &&
-	    ctrl->irq_ctx[vector])
+	    ctrl->irq_ctx[vector]) {
 		eventfd_signal(ctrl->irq_ctx[vector]);
-	else
+		atomic64_inc(&ctrl->stats.interrupts);
+	} else {
 		set_bit(vector, (unsigned long *)(ctrl->bar0 +
 			NVMET_MDEV_PCI_MSIX_PBA));
+	}
 	mutex_unlock(&ctrl->lock);
+}
+
+void nvmet_mdev_notify_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector,
+			   unsigned int completions, bool force)
+{
+	struct nvmet_mdev_irq_vector *irq;
+	unsigned int threshold;
+	bool start_timer = false;
+	bool signal = false;
+	u8 time;
+
+	if (WARN_ON_ONCE(vector >= NVMET_MDEV_PCI_MSIX_VECTORS))
+		return;
+
+	irq = &ctrl->irq_vectors[vector];
+	threshold = READ_ONCE(ctrl->irq_coalesce_threshold) + 1;
+	time = READ_ONCE(ctrl->irq_coalesce_time);
+
+	spin_lock(&irq->lock);
+	if (!irq->pending)
+		start_timer = true;
+	irq->pending += completions;
+	if (force || READ_ONCE(irq->coalescing_disabled) || !time ||
+	    irq->pending >= threshold) {
+		irq->pending = 0;
+		signal = true;
+		start_timer = false;
+	}
+	spin_unlock(&irq->lock);
+
+	if (signal) {
+		hrtimer_cancel(&irq->timer);
+		nvmet_mdev_signal_irq(ctrl, vector);
+	} else if (start_timer) {
+		hrtimer_start(&irq->timer,
+			      ns_to_ktime((u64)time * 100 * NSEC_PER_USEC),
+			      HRTIMER_MODE_REL);
+	}
 }
 
 void nvmet_mdev_update_pending_irqs(struct nvmet_mdev_ctrl *ctrl)
@@ -186,6 +283,7 @@ void nvmet_mdev_update_pending_irqs(struct nvmet_mdev_ctrl *ctrl)
 			continue;
 		clear_bit(vector, pba);
 		eventfd_signal(ctrl->irq_ctx[vector]);
+		atomic64_inc(&ctrl->stats.interrupts);
 	}
 
 out_unlock:
