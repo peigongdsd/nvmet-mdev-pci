@@ -417,6 +417,7 @@ struct nvmet_fabrics_ops {
 	unsigned int flags;
 #define NVMF_KEYED_SGLS			(1 << 0)
 #define NVMF_METADATA_SUPPORTED		(1 << 1)
+#define NVMF_NO_SGLS			BIT(2)
 	void (*queue_response)(struct nvmet_req *req);
 	int (*add_port)(struct nvmet_port *port);
 	void (*remove_port)(struct nvmet_port *port);

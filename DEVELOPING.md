@@ -97,8 +97,9 @@ tools/testing/kunit/kunit.py run \
 3. Register an `mdev-pci` transport and mediated-device parent per nvmet port.
 4. Expose PCI config space, BAR0 and MSI-X through VFIO.
 5. Allocate an nvmet controller per mdev UUID and implement admin queues.
-6. Pin guest queue/data pages and execute I/O directly through nvmet.
-7. Harden reset, removal and IOVA invalidation, then add shadow doorbells.
+6. Implement I/O queues and a bounded copy data path through nvmet.
+7. Harden reset, removal and IOVA invalidation.
+8. Pin payload pages for zero-copy I/O, then add shadow doorbells and batching.
 
 The normal BAR doorbells will remain trapped so they can wake an idle backend.
 The steady-state fast path will use NVMe shadow doorbells in guest memory.
@@ -122,12 +123,26 @@ array. Admin register validation is shared with `nvmet-pci-epf`, including
 CC command-set and entry-size checks, AQA reserved bits, CAP.MQES limits and
 4 KiB ASQ/ACQ alignment.
 
-Admin data uses PRPs and `vfio_dma_rw()` with a reported 1 MiB MDTS. This is
-appropriate for low-rate control traffic and does not impose a hugepage
-requirement. Admin SGL payloads currently receive an NVMe SGL error. I/O queue
-create/delete callbacks currently return an NVMe queue error rather than
-leaving a NULL transport callback.
+Layer 1 implements admin and I/O SQ/CQ creation and deletion, per-queue trapped
+doorbells, per-CQ completion routing and MSI-X delivery. Command payloads use
+PRPs and `vfio_dma_rw()` with a reported 1 MiB MDTS. Writes are copied from
+guest memory into nvmet-owned scatterlists before execution; successful reads
+are copied back before the completion is posted. This path supports ordinary
+guest pages and does not require hugepages. The controller does not advertise
+SGL support, so conforming hosts use the implemented PRP path.
 
-The next functional boundary is I/O queue creation and deletion followed by a
-pinned-page PRP/SGL data path. The latter must retain pages through asynchronous
-backend I/O and revoke them synchronously when VFIO calls `dma_unmap`.
+Queue mappings remain pinned while their queues are live. Overlapping queue
+mappings are rejected, and a VFIO DMA invalidation synchronously disables the
+controller before unpinning affected pages. MSI-X events raised while a vector
+is masked or has no eventfd are retained in the pending-bit array and replayed
+after the vector becomes usable.
+
+The remaining Layer 1 gate is a rebuilt-kernel VM run proving namespace
+enumeration, direct write/read comparison, flush, discard and controller reset.
+`tools/testing/nvmet-mdev-pci/guest-smoke.sh` performs those destructive guest
+checks after being given an explicit namespace path.
+
+Layer 2 replaces payload copies with request-lifetime page pinning, then adds
+parallel submission, shadow doorbells, completion batching and interrupt
+coalescing. Those changes are performance work and are intentionally separate
+from the functionally complete copy path.

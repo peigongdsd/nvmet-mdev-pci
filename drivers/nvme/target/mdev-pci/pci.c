@@ -256,8 +256,9 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 	size_t region_size;
 	u8 *region, *data;
 	u32 old_cc = 0, new_cc = 0;
-	unsigned int cq_db = NVME_REG_DBS + sizeof(u32);
-	bool sq_doorbell = false, cq_doorbell = false;
+	unsigned int first_db = 0, last_db = 0;
+	unsigned int doorbell_bytes = NVMET_MDEV_PCI_MSIX_TABLE - NVME_REG_DBS;
+	bool doorbells = false;
 	bool bar0 = false;
 	int index, ret;
 
@@ -282,10 +283,15 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 		old_cc = get_unaligned_le32(ctrl->bar0 + NVME_REG_CC);
 		nvmet_mdev_bar0_write(ctrl, offset, data, count);
 		new_cc = get_unaligned_le32(ctrl->bar0 + NVME_REG_CC);
-		sq_doorbell = nvmet_mdev_write_overlaps(offset, count,
-							NVME_REG_DBS, sizeof(u32));
-		cq_doorbell = nvmet_mdev_write_overlaps(offset, count, cq_db,
-							sizeof(u32));
+		if (nvmet_mdev_write_overlaps(offset, count, NVME_REG_DBS, doorbell_bytes)) {
+			unsigned int start = max_t(unsigned int, offset, NVME_REG_DBS);
+			unsigned int end = min_t(unsigned int, offset + count,
+						     NVMET_MDEV_PCI_MSIX_TABLE);
+
+			first_db = (start - NVME_REG_DBS) / sizeof(u32);
+			last_db = (end - 1 - NVME_REG_DBS) / sizeof(u32);
+			doorbells = true;
+		}
 	}
 
 	kfree(data);
@@ -295,8 +301,12 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 out_unlock:
 	mutex_unlock(&ctrl->lock);
 
-	if (ret < 0 || !bar0)
+	if (ret < 0)
 		return ret;
+	if (!bar0) {
+		nvmet_mdev_update_pending_irqs(ctrl);
+		return ret;
+	}
 
 	if (!(old_cc & NVME_CC_ENABLE) && (new_cc & NVME_CC_ENABLE))
 		nvmet_mdev_enable_ctrl(ctrl, new_cc);
@@ -305,9 +315,12 @@ out_unlock:
 		  (new_cc & NVME_CC_SHN_MASK)))
 		nvmet_mdev_disable_ctrl(ctrl, new_cc);
 
-	if (sq_doorbell)
-		nvmet_mdev_schedule_sq(ctrl);
-	if (cq_doorbell)
-		nvmet_mdev_schedule_cq(ctrl);
+	if (doorbells) {
+		unsigned int db;
+
+		for (db = first_db; db <= last_db; db++)
+			nvmet_mdev_schedule_doorbell(ctrl, db / 2, db & 1);
+	}
+	nvmet_mdev_update_pending_irqs(ctrl);
 	return ret;
 }

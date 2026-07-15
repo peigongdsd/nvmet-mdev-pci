@@ -50,28 +50,39 @@ struct nvmet_mdev_mapping {
 
 struct nvmet_mdev_ctrl;
 
-struct nvmet_mdev_admin_sq {
+struct nvmet_mdev_cq;
+
+struct nvmet_mdev_sq {
 	struct nvmet_mdev_ctrl *ctrl;
+	struct nvmet_mdev_cq *cq;
 	struct nvmet_sq nvme_sq;
 	struct nvmet_mdev_mapping *mapping;
 	struct work_struct work;
+	struct workqueue_struct *iod_wq;
 	u8 *entries;
+	u16 qid;
 	u16 depth;
 	u16 head;
 	bool live;
 };
 
-struct nvmet_mdev_admin_cq {
+struct nvmet_mdev_cq {
 	struct nvmet_mdev_ctrl *ctrl;
 	struct nvmet_cq nvme_cq;
 	struct nvmet_mdev_mapping *mapping;
 	struct work_struct work;
+	/* Protects completions waiting for a free CQ entry. */
+	spinlock_t lock;
+	struct list_head completions;
 	u8 *entries;
+	u16 qid;
 	u16 depth;
 	u16 head;
 	u16 tail;
 	u16 phase;
+	u16 vector;
 	bool live;
+	bool irq_enabled;
 };
 
 struct nvmet_mdev_ctrl {
@@ -82,16 +93,14 @@ struct nvmet_mdev_ctrl {
 	struct mutex state_lock;
 	/* Protects PCI config, BAR0 and interrupt eventfd state. */
 	struct mutex lock;
-	/* Protects the list of completed requests awaiting a free CQ slot. */
-	spinlock_t completion_lock;
 	u8 *config;
 	u8 *bar0;
 	struct eventfd_ctx *irq_ctx[NVMET_MDEV_PCI_MSIX_VECTORS];
 	struct nvmet_ctrl *tctrl;
 	struct list_head mappings;
-	struct list_head completions;
-	struct nvmet_mdev_admin_sq admin_sq;
-	struct nvmet_mdev_admin_cq admin_cq;
+	struct nvmet_mdev_sq *sqs;
+	struct nvmet_mdev_cq *cqs;
+	u16 nr_queues;
 	bool enabled;
 };
 
@@ -118,6 +127,7 @@ int nvmet_mdev_irq_info(struct vfio_irq_info *info);
 int nvmet_mdev_set_irqs(struct nvmet_mdev_ctrl *ctrl,
 			struct vfio_irq_set *hdr, void *data);
 void nvmet_mdev_signal_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector);
+void nvmet_mdev_update_pending_irqs(struct nvmet_mdev_ctrl *ctrl);
 
 int nvmet_mdev_map_guest(struct nvmet_mdev_ctrl *ctrl, u64 iova,
 			 size_t length, int prot,
@@ -128,11 +138,12 @@ void nvmet_mdev_unmap_all(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_dma_unmap(struct nvmet_mdev_ctrl *ctrl, u64 iova, u64 length);
 void *nvmet_mdev_mapping_addr(const struct nvmet_mdev_mapping *mapping);
 
-void nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl);
+int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl);
+void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl);
 int nvmet_mdev_enable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc);
 void nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc);
-void nvmet_mdev_schedule_sq(struct nvmet_mdev_ctrl *ctrl);
-void nvmet_mdev_schedule_cq(struct nvmet_mdev_ctrl *ctrl);
+void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
+				  bool cq);
 void nvmet_mdev_queue_response(struct nvmet_req *req);
 u8 nvmet_mdev_get_mdts(const struct nvmet_ctrl *tctrl);
 u16 nvmet_mdev_create_sq(struct nvmet_ctrl *tctrl, u16 sqid, u16 cqid,

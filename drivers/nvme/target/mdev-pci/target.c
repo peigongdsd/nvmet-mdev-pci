@@ -74,6 +74,7 @@ const struct nvmet_fabrics_ops nvmet_mdev_fabrics_ops = {
 	.owner		= THIS_MODULE,
 	.name		= "mdev-pci",
 	.type		= NVMF_TRTYPE_PCI,
+	.flags		= NVMF_NO_SGLS,
 	.add_port	= nvmet_mdev_add_port,
 	.remove_port	= nvmet_mdev_remove_port,
 	.delete_ctrl	= nvmet_mdev_delete_ctrl,

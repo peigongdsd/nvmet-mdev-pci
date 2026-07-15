@@ -65,6 +65,7 @@ static int nvmet_mdev_set_eventfds(struct nvmet_mdev_ctrl *ctrl,
 		new_ctx[i] = NULL;
 	}
 	mutex_unlock(&ctrl->lock);
+	nvmet_mdev_update_pending_irqs(ctrl);
 
 out_put:
 	for (i = 0; i < count; i++) {
@@ -153,5 +154,40 @@ void nvmet_mdev_signal_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector)
 	    !(vector_ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT) &&
 	    ctrl->irq_ctx[vector])
 		eventfd_signal(ctrl->irq_ctx[vector]);
+	else
+		set_bit(vector, (unsigned long *)(ctrl->bar0 +
+			NVMET_MDEV_PCI_MSIX_PBA));
+	mutex_unlock(&ctrl->lock);
+}
+
+void nvmet_mdev_update_pending_irqs(struct nvmet_mdev_ctrl *ctrl)
+{
+	unsigned long *pba = (unsigned long *)(ctrl->bar0 +
+					       NVMET_MDEV_PCI_MSIX_PBA);
+	u16 flags;
+	unsigned int vector;
+
+	mutex_lock(&ctrl->lock);
+	flags = get_unaligned_le16(ctrl->config + NVMET_MDEV_PCI_MSIX_CAP +
+				   PCI_MSIX_FLAGS);
+	if (!(flags & PCI_MSIX_FLAGS_ENABLE) ||
+	    (flags & PCI_MSIX_FLAGS_MASKALL))
+		goto out_unlock;
+
+	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++) {
+		u32 vector_ctrl;
+
+		if (!test_bit(vector, pba) || !ctrl->irq_ctx[vector])
+			continue;
+		vector_ctrl = get_unaligned_le32(ctrl->bar0 +
+			NVMET_MDEV_PCI_MSIX_TABLE +
+			vector * PCI_MSIX_ENTRY_SIZE + PCI_MSIX_ENTRY_VECTOR_CTRL);
+		if (vector_ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT)
+			continue;
+		clear_bit(vector, pba);
+		eventfd_signal(ctrl->irq_ctx[vector]);
+	}
+
+out_unlock:
 	mutex_unlock(&ctrl->lock);
 }
