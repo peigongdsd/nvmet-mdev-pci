@@ -41,6 +41,7 @@ is created:
 echo 32768 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pin_cache_pages
 echo 32 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pin_cache_max_segs
 echo 64 | sudo tee /sys/module/nvmet_mdev_pci/parameters/poll_budget
+echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/response_workers
 ```
 
 The default pin cache is 65536 pages and admits up to 64 PRP segments per
@@ -48,6 +49,9 @@ request. Setting either cache limit to zero measures request-lifetime pinning
 without persistent cache entries. Record `response_work_runs`,
 `response_batches`, `response_items`, `iod_cache_hits`, and `iod_cache_misses`
 alongside the existing queue and pin counters.
+Compare `response_workers=1` against `0` for serialized versus automatically
+parallel cleanup. Explicit values above one select that many lanes, capped by
+the SQ depth and 64.
 Use identical guest images, namespace sizes, fio versions, CPU affinity, and
 cache warmup for all runs. Cache hit rate must be reported alongside IOPS: a
 small cache and a large uniform-random working set can otherwise make the

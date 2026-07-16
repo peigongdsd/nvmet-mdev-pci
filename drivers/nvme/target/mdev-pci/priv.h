@@ -108,6 +108,7 @@ struct nvmet_mdev_runtime_config {
 	unsigned int pin_cache_pages;
 	unsigned int pin_cache_max_segs;
 	unsigned int poll_budget;
+	unsigned int response_workers;
 };
 
 struct nvmet_mdev_stats {
@@ -176,6 +177,16 @@ struct nvmet_mdev_irq_vector {
 };
 
 struct nvmet_mdev_cq;
+struct nvmet_mdev_sq;
+
+struct nvmet_mdev_response_lane {
+	struct nvmet_mdev_sq *sq;
+	struct work_struct work;
+	/* Protects responses and work_queued. */
+	spinlock_t lock;
+	struct list_head responses;
+	atomic_t work_queued;
+};
 
 struct nvmet_mdev_sq {
 	struct nvmet_mdev_ctrl *ctrl;
@@ -184,11 +195,8 @@ struct nvmet_mdev_sq {
 	struct nvmet_mdev_mapping *mapping;
 	struct work_struct work;
 	struct workqueue_struct *iod_wq;
-	struct work_struct response_work;
-	/* Protects responses and response_work_queued. */
-	spinlock_t response_lock;
-	struct list_head responses;
-	atomic_t response_work_queued;
+	struct nvmet_mdev_response_lane *response_lanes;
+	unsigned int nr_response_lanes;
 	u8 *entries;
 	u16 qid;
 	u16 depth;

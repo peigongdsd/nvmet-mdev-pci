@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/iommu.h>
+#include <linux/cpu.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/rcupdate.h>
@@ -16,6 +17,7 @@
 #define NVMET_MDEV_PRP_ENTRIES		(SZ_4K / sizeof(__le64))
 #define NVMET_MDEV_MAX_SEGS		(NVMET_MDEV_COPY_MAX_DATA / SZ_4K + 1)
 #define NVMET_MDEV_BATCH_SIZE		64
+#define NVMET_MDEV_MAX_RESPONSE_WORKERS	64
 #define NVMET_MDEV_POLL_INTERVAL	msecs_to_jiffies(10)
 
 static uint pin_cache_pages = 65536;
@@ -29,6 +31,11 @@ MODULE_PARM_DESC(pin_cache_max_segs, "Maximum PRP segments admitted to the pin c
 static uint poll_budget = 128;
 module_param_named(poll_budget, poll_budget, uint, 0644);
 MODULE_PARM_DESC(poll_budget, "Maximum queues examined by one bounded DBBUF poll run");
+
+static uint response_workers;
+module_param_named(response_workers, response_workers, uint, 0644);
+MODULE_PARM_DESC(response_workers,
+		 "Response cleanup workers per I/O SQ (0 selects an automatic count)");
 
 struct nvmet_mdev_iod {
 	struct list_head entry;
@@ -464,8 +471,9 @@ static void nvmet_mdev_response_iod(struct nvmet_mdev_iod *iod)
 
 static void nvmet_mdev_response_work(struct work_struct *work)
 {
-	struct nvmet_mdev_sq *sq =
-		container_of(work, struct nvmet_mdev_sq, response_work);
+	struct nvmet_mdev_response_lane *lane =
+		container_of(work, struct nvmet_mdev_response_lane, work);
+	struct nvmet_mdev_sq *sq = lane->sq;
 	struct nvmet_mdev_ctrl *ctrl = sq->ctrl;
 	unsigned long flags;
 
@@ -475,14 +483,14 @@ static void nvmet_mdev_response_work(struct work_struct *work)
 		unsigned int nr = 0;
 		LIST_HEAD(responses);
 
-		spin_lock_irqsave(&sq->response_lock, flags);
-		if (list_empty(&sq->responses)) {
-			atomic_set(&sq->response_work_queued, 0);
-			spin_unlock_irqrestore(&sq->response_lock, flags);
+		spin_lock_irqsave(&lane->lock, flags);
+		if (list_empty(&lane->responses)) {
+			atomic_set(&lane->work_queued, 0);
+			spin_unlock_irqrestore(&lane->lock, flags);
 			return;
 		}
-		list_splice_init(&sq->responses, &responses);
-		spin_unlock_irqrestore(&sq->response_lock, flags);
+		list_splice_init(&lane->responses, &responses);
+		spin_unlock_irqrestore(&lane->lock, flags);
 
 		list_for_each_entry_safe(iod, tmp, &responses, entry) {
 			list_del_init(&iod->entry);
@@ -749,19 +757,24 @@ void nvmet_mdev_queue_response(struct nvmet_req *req)
 	struct nvmet_mdev_iod *iod =
 		container_of(req, struct nvmet_mdev_iod, req);
 	struct nvmet_mdev_sq *sq = iod->sq;
+	struct nvmet_mdev_response_lane *lane;
 	unsigned long flags;
+	unsigned int lane_id;
 	bool queue;
 
 	if (iod->pinned && iod->payload.cached) {
 		nvmet_mdev_response_iod(iod);
 		return;
 	}
-	spin_lock_irqsave(&sq->response_lock, flags);
-	list_add_tail(&iod->entry, &sq->responses);
-	queue = atomic_cmpxchg(&sq->response_work_queued, 0, 1) == 0;
-	spin_unlock_irqrestore(&sq->response_lock, flags);
+	lane_id = le16_to_cpu(iod->cmd.common.command_id) %
+		   sq->nr_response_lanes;
+	lane = &sq->response_lanes[lane_id];
+	spin_lock_irqsave(&lane->lock, flags);
+	list_add_tail(&iod->entry, &lane->responses);
+	queue = atomic_cmpxchg(&lane->work_queued, 0, 1) == 0;
+	spin_unlock_irqrestore(&lane->lock, flags);
 	if (queue)
-		WARN_ON_ONCE(!queue_work(sq->iod_wq, &sq->response_work));
+		WARN_ON_ONCE(!queue_work(sq->iod_wq, &lane->work));
 }
 
 static void nvmet_mdev_drain_completions(struct nvmet_mdev_cq *cq)
@@ -787,6 +800,7 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	ctrl->runtime.pin_cache_pages = READ_ONCE(pin_cache_pages);
 	ctrl->runtime.pin_cache_max_segs = READ_ONCE(pin_cache_max_segs);
 	ctrl->runtime.poll_budget = max_t(unsigned int, READ_ONCE(poll_budget), 1);
+	ctrl->runtime.response_workers = READ_ONCE(response_workers);
 	mutex_init(&ctrl->state_lock);
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);
 	ctrl->poll_next_qid = 1;
@@ -821,10 +835,6 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		sq->ctrl = ctrl;
 		sq->qid = qid;
 		INIT_WORK(&sq->work, nvmet_mdev_sq_work);
-		INIT_WORK(&sq->response_work, nvmet_mdev_response_work);
-		spin_lock_init(&sq->response_lock);
-		INIT_LIST_HEAD(&sq->responses);
-		atomic_set(&sq->response_work_queued, 0);
 		cq->ctrl = ctrl;
 		cq->qid = qid;
 		spin_lock_init(&cq->lock);
@@ -835,6 +845,21 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	}
 
 	return 0;
+}
+
+static unsigned int
+nvmet_mdev_response_worker_count(struct nvmet_mdev_ctrl *ctrl, u16 qid,
+				 unsigned int depth)
+{
+	unsigned int requested = ctrl->runtime.response_workers;
+	unsigned int maximum = min_t(unsigned int, depth,
+				     NVMET_MDEV_MAX_RESPONSE_WORKERS);
+
+	if (!qid)
+		return 1;
+	if (!requested)
+		requested = num_online_cpus();
+	return clamp_t(unsigned int, requested, 1, maximum);
 }
 
 static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
@@ -907,7 +932,10 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 {
 	struct nvmet_mdev_sq *sq;
 	struct nvmet_mdev_cq *cq;
+	struct nvmet_mdev_response_lane *response_lanes;
 	struct workqueue_struct *iod_wq;
+	unsigned int nr_response_lanes;
+	unsigned int lane;
 	size_t size;
 	u16 status;
 	int ret;
@@ -932,6 +960,20 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 					 min_t(unsigned int, depth, 64), qid);
 	if (!iod_wq)
 		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
+	nr_response_lanes = nvmet_mdev_response_worker_count(ctrl, qid, depth);
+	response_lanes = kcalloc(nr_response_lanes, sizeof(*response_lanes),
+				 GFP_KERNEL);
+	if (!response_lanes) {
+		destroy_workqueue(iod_wq);
+		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
+	}
+	for (lane = 0; lane < nr_response_lanes; lane++) {
+		response_lanes[lane].sq = sq;
+		INIT_WORK(&response_lanes[lane].work, nvmet_mdev_response_work);
+		spin_lock_init(&response_lanes[lane].lock);
+		INIT_LIST_HEAD(&response_lanes[lane].responses);
+		atomic_set(&response_lanes[lane].work_queued, 0);
+	}
 
 	mutex_lock(&ctrl->lock);
 	if (sq->live || !cq->live) {
@@ -950,6 +992,8 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 	sq->head = 0;
 	sq->cq = cq;
 	sq->iod_wq = iod_wq;
+	sq->response_lanes = response_lanes;
+	sq->nr_response_lanes = nr_response_lanes;
 	put_unaligned_le32(0, ctrl->bar0 + NVME_REG_DBS +
 			   (qid * 2 * sizeof(u32)));
 
@@ -962,6 +1006,8 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 		sq->depth = 0;
 		sq->cq = NULL;
 		sq->iod_wq = NULL;
+		sq->response_lanes = NULL;
+		sq->nr_response_lanes = 0;
 		goto out_destroy_wq;
 	}
 	sq->live = true;
@@ -971,12 +1017,14 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 out_destroy_wq:
 	mutex_unlock(&ctrl->lock);
 	destroy_workqueue(iod_wq);
+	kfree(response_lanes);
 	return status;
 }
 
 static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 {
 	struct workqueue_struct *iod_wq;
+	struct nvmet_mdev_response_lane *response_lanes;
 	struct nvmet_mdev_sq *sq;
 
 	lockdep_assert_held(&ctrl->state_lock);
@@ -991,12 +1039,14 @@ static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 	}
 	sq->live = false;
 	iod_wq = sq->iod_wq;
+	response_lanes = sq->response_lanes;
 	mutex_unlock(&ctrl->lock);
 
 	cancel_work_sync(&sq->work);
 	flush_workqueue(iod_wq);
 	nvmet_sq_destroy(&sq->nvme_sq);
 	destroy_workqueue(iod_wq);
+	kfree(response_lanes);
 
 	mutex_lock(&ctrl->lock);
 	if (sq->mapping)
@@ -1004,6 +1054,8 @@ static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 	sq->mapping = NULL;
 	sq->entries = NULL;
 	sq->iod_wq = NULL;
+	sq->response_lanes = NULL;
+	sq->nr_response_lanes = 0;
 	sq->cq = NULL;
 	sq->depth = 0;
 	sq->head = 0;
