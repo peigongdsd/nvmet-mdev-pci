@@ -96,6 +96,7 @@ struct nvmet_mdev_runtime_config {
 	bool lockless_io;
 	bool budget_poll;
 	bool fast_doorbell;
+	bool msix_scan_suppress;
 	bool cq_head_suppress;
 	unsigned int pin_cache_pages;
 	unsigned int pin_cache_max_segs;

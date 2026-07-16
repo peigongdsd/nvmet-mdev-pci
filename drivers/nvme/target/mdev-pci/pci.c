@@ -319,8 +319,10 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 
 	if (index == VFIO_PCI_CONFIG_REGION_INDEX) {
 		nvmet_mdev_config_write(ctrl, offset, data, count);
-		update_irqs = nvmet_mdev_write_overlaps(offset, count,
-			NVMET_MDEV_PCI_MSIX_CAP + PCI_MSIX_FLAGS, sizeof(u16));
+		update_irqs = !ctrl->runtime.msix_scan_suppress ||
+			nvmet_mdev_write_overlaps(offset, count,
+				NVMET_MDEV_PCI_MSIX_CAP + PCI_MSIX_FLAGS,
+				sizeof(u16));
 	} else {
 		bar0 = true;
 		old_cc = get_unaligned_le32(ctrl->bar0 + NVME_REG_CC);
@@ -335,9 +337,10 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 			last_db = (end - 1 - NVME_REG_DBS) / sizeof(u32);
 			doorbells = true;
 		}
-		update_irqs = nvmet_mdev_write_overlaps(offset, count,
-			NVMET_MDEV_PCI_MSIX_TABLE,
-			NVMET_MDEV_PCI_MSIX_VECTORS * PCI_MSIX_ENTRY_SIZE);
+		update_irqs = !ctrl->runtime.msix_scan_suppress ||
+			nvmet_mdev_write_overlaps(offset, count,
+				NVMET_MDEV_PCI_MSIX_TABLE,
+				NVMET_MDEV_PCI_MSIX_VECTORS * PCI_MSIX_ENTRY_SIZE);
 	}
 
 	kfree(data);

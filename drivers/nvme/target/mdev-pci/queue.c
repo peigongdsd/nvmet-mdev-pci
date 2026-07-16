@@ -64,6 +64,11 @@ static bool fast_doorbell = true;
 module_param_named(fast_doorbell, fast_doorbell, bool, 0644);
 MODULE_PARM_DESC(fast_doorbell, "Use the allocation-free 32-bit doorbell write path");
 
+static bool msix_scan_suppress = true;
+module_param_named(msix_scan_suppress, msix_scan_suppress, bool, 0644);
+MODULE_PARM_DESC(msix_scan_suppress,
+		 "Scan pending MSI-X vectors only after mask or table writes");
+
 static bool cq_head_suppress = true;
 module_param_named(cq_head_suppress, cq_head_suppress, bool, 0644);
 MODULE_PARM_DESC(cq_head_suppress,
@@ -938,6 +943,7 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	ctrl->runtime.lockless_io = READ_ONCE(lockless_io);
 	ctrl->runtime.budget_poll = READ_ONCE(budget_poll);
 	ctrl->runtime.fast_doorbell = READ_ONCE(fast_doorbell);
+	ctrl->runtime.msix_scan_suppress = READ_ONCE(msix_scan_suppress);
 	ctrl->runtime.cq_head_suppress = READ_ONCE(cq_head_suppress);
 	ctrl->runtime.pin_cache_pages = READ_ONCE(pin_cache_pages);
 	ctrl->runtime.pin_cache_max_segs = READ_ONCE(pin_cache_max_segs);
