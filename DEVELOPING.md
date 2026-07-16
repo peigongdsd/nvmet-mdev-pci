@@ -148,8 +148,9 @@ the regression fix.
 
 The Layer 2 batch replaces I/O payload copies with request-lifetime page
 pinning and adds parallel submission, SQ/CQ batching, interrupt coalescing and
-shadow doorbells. Admin payloads retain the simpler copy path, and
-`pinned_io=0` provides an I/O A/B baseline. The batch passes focused compilation
-and KUnit checks but requires a rebuilt-kernel VM smoke run before it can be
-called runtime-complete. See `PERFORMANCE.md` for the safety invariants,
-benchmark matrix and acceptance gates.
+shadow doorbells. Admin payloads retain the simpler copy path. The optimized
+I/O implementation is now the sole production path; only cache sizing and poll
+budget remain configurable. The batch passes focused compilation and KUnit
+checks but requires a rebuilt-kernel VM smoke run before it can be called
+runtime-complete. See `PERFORMANCE.md` for the safety invariants, benchmark
+matrix and acceptance gates.

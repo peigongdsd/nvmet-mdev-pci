@@ -2,14 +2,20 @@
 #ifndef _NVMET_MDEV_PCI_PRIV_H
 #define _NVMET_MDEV_PCI_PRIV_H
 
+#include <asm/local64.h>
+
 #include <linux/device.h>
 #include <linux/eventfd.h>
 #include <linux/hrtimer.h>
 #include <linux/list.h>
+#include <linux/llist.h>
 #include <linux/mdev.h>
 #include <linux/mempool.h>
 #include <linux/mutex.h>
+#include <linux/percpu.h>
+#include <linux/preempt.h>
 #include <linux/refcount.h>
+#include <linux/rwsem.h>
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
@@ -71,6 +77,16 @@ struct nvmet_mdev_pin_cache_entry {
 	u64 iova;
 };
 
+struct nvmet_mdev_payload_backing {
+	struct sg_table sgt;
+	struct nvmet_mdev_pin_run *runs;
+	struct page **pages;
+	struct nvmet_mdev_pin_cache_entry **cache_entries;
+	unsigned int capacity;
+	unsigned int runs_capacity;
+	unsigned int cache_entries_capacity;
+};
+
 struct nvmet_mdev_payload {
 	struct list_head entry;
 	struct sg_table sgt;
@@ -81,6 +97,7 @@ struct nvmet_mdev_payload {
 	struct nvmet_mdev_pin_run inline_runs[NVMET_MDEV_INLINE_SEGS];
 	struct page *inline_pages[NVMET_MDEV_INLINE_SEGS];
 	struct nvmet_mdev_pin_cache_entry *inline_cache_entries[NVMET_MDEV_INLINE_SEGS];
+	struct nvmet_mdev_payload_backing backing;
 	unsigned int nr_runs;
 	unsigned int nr_entries;
 	bool active;
@@ -88,49 +105,62 @@ struct nvmet_mdev_payload {
 };
 
 struct nvmet_mdev_runtime_config {
-	bool pinned_io;
-	bool inline_data;
-	bool pin_cache;
-	bool direct_submit;
-	bool direct_complete;
-	bool lockless_io;
-	bool budget_poll;
-	bool fast_doorbell;
-	bool msix_scan_suppress;
-	bool cq_head_suppress;
 	unsigned int pin_cache_pages;
 	unsigned int pin_cache_max_segs;
 	unsigned int poll_budget;
 };
 
 struct nvmet_mdev_stats {
-	atomic64_t commands;
-	atomic64_t pinned_io_bytes;
-	atomic64_t completions;
-	atomic64_t interrupts;
-	atomic64_t doorbell_kicks;
-	atomic64_t poll_runs;
-	atomic64_t poll_queue_checks;
-	atomic64_t prp_heap_allocs;
-	atomic64_t payload_sg_heap_allocs;
-	atomic64_t pin_calls;
-	atomic64_t unpin_calls;
-	atomic64_t pin_cache_hits;
-	atomic64_t pin_cache_misses;
-	atomic64_t pin_cache_evictions;
-	atomic64_t pin_cache_permission_fallbacks;
-	atomic64_t payload_dma_lock_contentions;
-	atomic64_t submit_work_hops;
-	atomic64_t response_work_hops;
-	atomic64_t sq_work_runs;
-	atomic64_t cq_work_runs;
-	atomic64_t sq_batches;
-	atomic64_t cq_batches;
-	atomic64_t poll_wakeups;
-	atomic64_t poll_sleeps;
-	atomic64_t fast_doorbell_writes;
-	atomic64_t cq_head_wakeups;
+	local64_t commands;
+	local64_t pinned_io_bytes;
+	local64_t completions;
+	local64_t interrupts;
+	local64_t doorbell_kicks;
+	local64_t poll_runs;
+	local64_t poll_queue_checks;
+	local64_t prp_heap_allocs;
+	local64_t payload_sg_heap_allocs;
+	local64_t pin_calls;
+	local64_t unpin_calls;
+	local64_t pin_cache_hits;
+	local64_t pin_cache_misses;
+	local64_t pin_cache_evictions;
+	local64_t pin_cache_permission_fallbacks;
+	local64_t payload_dma_lock_contentions;
+	local64_t response_work_runs;
+	local64_t response_batches;
+	local64_t response_items;
+	local64_t iod_cache_hits;
+	local64_t iod_cache_misses;
+	local64_t sq_work_runs;
+	local64_t cq_work_runs;
+	local64_t sq_batches;
+	local64_t cq_batches;
+	local64_t poll_wakeups;
+	local64_t poll_sleeps;
+	local64_t fast_doorbell_writes;
+	local64_t cq_head_wakeups;
 };
+
+#define nvmet_mdev_stat_add(ctrl, member, value) do { \
+	struct nvmet_mdev_stats *__stats; \
+	preempt_disable(); \
+	__stats = this_cpu_ptr((ctrl)->stats); \
+	local64_add((value), &__stats->member); \
+	preempt_enable(); \
+} while (0)
+
+#define nvmet_mdev_stat_inc(ctrl, member) \
+	nvmet_mdev_stat_add(ctrl, member, 1)
+
+#define nvmet_mdev_stat_read(ctrl, member) ({ \
+	u64 __total = 0; \
+	int __cpu; \
+	for_each_possible_cpu(__cpu) \
+		__total += local64_read( \
+			&per_cpu_ptr((ctrl)->stats, __cpu)->member); \
+	__total; \
+})
 
 struct nvmet_mdev_ctrl;
 
@@ -154,6 +184,11 @@ struct nvmet_mdev_sq {
 	struct nvmet_mdev_mapping *mapping;
 	struct work_struct work;
 	struct workqueue_struct *iod_wq;
+	struct work_struct response_work;
+	/* Protects responses and response_work_queued. */
+	spinlock_t response_lock;
+	struct list_head responses;
+	atomic_t response_work_queued;
 	u8 *entries;
 	u16 qid;
 	u16 depth;
@@ -187,12 +222,16 @@ struct nvmet_mdev_ctrl {
 	struct vfio_device vdev;
 	struct mdev_device *mdev;
 	struct nvmet_mdev_port *mport;
-	/* Lock order for nested acquisition: state_lock -> lock -> dma_lock. */
+	/* Lock order: state_lock -> dma_pin_lock -> lock -> dma_lock. */
 	/* Serializes controller enable, disable and queue teardown. */
 	struct mutex state_lock;
-	/* Protects PCI config, BAR0 and interrupt eventfd state. */
+	/* Protects controller lifecycle registers and non-MSI-X PCI state. */
 	struct mutex lock;
-	/* Protects payload pins, the pin cache and DMA invalidation state. */
+	/* Serializes MSI-X masks, pending bits and eventfd replacement. */
+	spinlock_t irq_state_lock;
+	/* Excludes VFIO invalidation from request pin admission. */
+	struct rw_semaphore dma_pin_lock;
+	/* Protects active payload metadata, the pin cache and blocked state. */
 	struct mutex dma_lock;
 	u8 *config;
 	u8 *bar0;
@@ -213,11 +252,13 @@ struct nvmet_mdev_ctrl {
 	__le32 *dbbuf_dbs;
 	__le32 *dbbuf_eis;
 	struct delayed_work poll_work;
-	unsigned long poll_busy_until;
 	unsigned int poll_next_qid;
-	struct nvmet_mdev_stats stats;
+	struct nvmet_mdev_stats __percpu *stats;
 	struct nvmet_mdev_runtime_config runtime;
 	mempool_t iod_pool;
+	struct llist_head iod_free;
+	atomic_t iod_free_count;
+	unsigned int iod_free_limit;
 	u16 nr_queues;
 	bool iod_pool_ready;
 	bool enabled;
@@ -267,6 +308,7 @@ int nvmet_mdev_pin_payload(struct nvmet_mdev_ctrl *ctrl,
 			   struct nvmet_mdev_payload *payload);
 void nvmet_mdev_unpin_payload(struct nvmet_mdev_ctrl *ctrl,
 			      struct nvmet_mdev_payload *payload);
+void nvmet_mdev_payload_destroy(struct nvmet_mdev_payload *payload);
 void nvmet_mdev_iova_init(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_iova_reset(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_iova_cleanup(struct nvmet_mdev_ctrl *ctrl);

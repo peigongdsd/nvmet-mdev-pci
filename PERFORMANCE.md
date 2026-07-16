@@ -2,75 +2,57 @@
 
 ## Implementation status
 
-The performance work now has two batches. The first implemented PRP collection,
-request-lifetime VFIO pins, transport-owned SG tables, DMA invalidation drains,
-explicit IOD references, parallel I/O workers, SQ/CQ batching, a mempool, real
-interrupt coalescing, generic nvmet Doorbell Buffer Config support, pinned
-shadow/event arrays, and adaptive polling.
+The production path implements PRP collection, request-lifetime VFIO pins,
+transport-owned SG tables, invalidation drains, explicit IOD references,
+parallel I/O submission, SQ/CQ batching, NVMe interrupt coalescing, Doorbell
+Buffer Config, pinned shadow/event arrays, and bounded event-index polling.
+Small requests use inline metadata and the pin cache is bounded per controller.
 
-The second batch targets the CPU cost observed in the first VM benchmark. It
-adds inline request metadata, a bounded reusable pin cache with batched cold
-misses, direct SQ submission, direct cached-payload completion, narrower
-controller locking, CQ scheduling coalescing, and event-index-driven bounded
-polling. Every optimization has a module-parameter switch, snapshotted per mdev
-controller, so one kernel build can run the complete A/B matrix.
+The latest CPU patch removes the old implementation-choice module switches and
+makes the measured fast paths unconditional. Hot counters are per-CPU, MSI-X is
+signalled directly when NVMe coalescing is inactive, non-cached responses are
+cleaned in per-SQ batches, and completed IODs retain lazily grown PRP and payload
+metadata in a bounded recycle cache. Uncached request pins run concurrently;
+the DMA-unmap path takes an exclusive admission gate before inspecting active
+payloads. Cache xarray/LRU mutation remains serialized.
 
-Measurement uses per-mdev `transport_stats` counters rather than debugfs and
-tracepoints in the first batch. This avoids unconditional per-page atomics and
-keeps the instrumentation usable from the benchmark scripts. Full PRP-list and
-event-index behavior has focused KUnit coverage. The remaining acceptance gate
-is a rebuilt-kernel VM run followed by the fio/host-perf matrix; compile success
-alone does not establish runtime correctness or a performance gain.
+The trace that motivated this patch covered 7.17 million commands and observed
+6.88 million CQ worker runs, 6.87 million interrupts, and 13.81 million
+doorbells. The old atomic instrumentation performed at least 141.4 million
+counter operations, or 19.7 per command. The 4 KiB phase achieved a 98.66
+percent pin-cache hit rate, while the roughly 1 MiB phase made about 27 pin and
+unpin calls per command, spent 87 percent of measured response time in cleanup,
+and observed 7.86 percent contention on the DMA metadata mutex. These data map
+directly to per-CPU statistics, response/IOD batching, retained metadata, and
+parallel uncached pinning respectively.
 
-The pre-optimization reference run reached about 1.1-1.16 GiB/s for 128 KiB
-sequential I/O and 31.7k IOPS for a 4 KiB 70/30 random mix at aggregate QD128.
-The random phase consumed about 46.7 percent system CPU across 20 host CPUs,
-roughly nine cores or 284 host CPU microseconds per I/O. Only 8,967 trapped
-doorbells and 483,916 interrupts served about 9.97 million commands, while the
-poller performed about 940 million queue scans. Those numbers make page-pin
-calls, workqueue transitions, allocation, controller-lock traffic, and polling
-the primary hypotheses for this batch.
+Full PRP-list and event-index behavior has focused KUnit coverage. The remaining
+acceptance gate is a rebuilt-kernel VM run followed by the fio/host-perf matrix;
+compile success alone does not establish runtime correctness or a performance
+gain.
 
-## Runtime experiment matrix
+## Runtime policy
 
-All controls default on. Change them only after stopping QEMU and removing the
-mdev, then recreate the mdev and confirm `$MDEV/runtime_config`.
+Only sizing and polling policy are module parameters. Their values are
+snapshotted when an mdev controller is created:
 
-| Switch | Isolated hypothesis | Expected evidence |
-| --- | --- | --- |
-| `inline_data` | Small PRP/SG allocations consume CPU. | `prp_heap_allocs` and `payload_sg_heap_allocs` approach zero for 4 KiB and aligned 128 KiB I/O. |
-| `pin_cache` | Repeated VFIO pin/unpin dominates random I/O. | Warm-cache `pin_cache_hits` rise while `pin_calls` and `unpin_calls` per command fall. |
-| `direct_submit` | Per-command submission work adds scheduling cost. | `submit_work_hops` becomes zero and context switches fall. |
-| `direct_complete` | Response work adds another scheduling hop. | With cached pins and lockless I/O, `response_work_hops` becomes zero. |
-| `lockless_io` | `ctrl->lock` serializes hot SQ/CQ paths. | Four-job scaling and task-clock per I/O improve without correctness changes. |
-| `budget_poll` | Adaptive busy polling wastes host cores. | `poll_queue_checks` per command falls without a QD1 latency regression. |
-| `fast_doorbell` | Allocating a buffer for every 32-bit doorbell wastes CPU. | `fast_doorbell_writes` tracks allocation-free trapped kicks while allocation profiles and kernel CPU fall. |
-| `msix_scan_suppress` | Scanning all pending MSI-X vectors after unrelated MMIO wastes CPU. | IRQ delivery is unchanged while samples in the pending-vector scan fall. |
-| `cq_head_suppress` | Guest CQ-head writes wake workers even when no completion is blocked. | `cq_head_wakeups` and `cq_work_runs` fall while completion counts remain unchanged. |
+| Parameter | Default | Policy |
+| --- | ---: | --- |
+| `pin_cache_pages` | 65536 | Maximum persistent guest-page pins per controller. |
+| `pin_cache_max_segs` | 64 | Maximum PRP segments admitted to the persistent pin cache. |
+| `poll_budget` | 128 | Maximum queue pairs examined by one safety poll. |
 
-Measure a copy baseline, a request-lifetime pinned baseline, each switch added
-individually in the order above, and the all-on profile. For `pin_cache`, report
-both a cold run and an identical warm run, cache hit rate, and the random
-working-set size. The default cache holds 65536 pages, or 256 MiB with 4 KiB
-pages, and admits requests with up to 64 PRP segments. This covers common
-128 KiB requests, including an unaligned first PRP, while retaining a strict
-per-controller memory bound. Compare cold and warm runs and lower the capacity
-separately when measuring memory/performance tradeoffs.
+Setting either cache limit to zero disables persistent cache entries but keeps
+request-lifetime pinned I/O. The default cache holds 256 MiB with 4 KiB pages
+and covers common 128 KiB requests, including an unaligned first PRP.
 
 `poll_runs` counts poll function iterations and `poll_queue_checks` counts
-queue-pair loop iterations, including event publication and race checks. Both
-polling modes use those definitions, so their
-deltas can be compared directly. `pinned_io_bytes` is the amount of command
-payload handled by the pinned path, including cache hits; actual pinning cost
-is represented by `pin_calls`, `unpin_calls`, and the cache counters.
-`fast_doorbell_writes` counts exact aligned 32-bit BAR doorbells handled without
-a heap allocation. `cq_head_wakeups` counts CQ-head notifications that actually
-needed a worker because suppression was disabled, the head was invalid, or a
-full CQ had pending completions.
-The payload pin/cache metadata remains protected by one controller-wide mutex.
-Use `payload_dma_lock_contentions` to decide whether cache sharding or a
-two-phase pin insertion scheme is justified; the current batch does not claim
-that the pinned path is lock-free.
+queue-pair loop iterations. `pinned_io_bytes` includes cache hits; actual pin
+cost is represented by `pin_calls`, `unpin_calls`, and the cache counters.
+`response_work_runs`, `response_batches`, and `response_items` show cleanup
+aggregation, while `iod_cache_hits` and `iod_cache_misses` show object/metadata
+reuse. `payload_dma_lock_contentions` now covers short admission/cache metadata
+critical sections rather than the complete uncached `vfio_pin_pages()` call.
 
 ## Goals and constraints
 
@@ -156,9 +138,8 @@ Files:
 For I/O queues, assign the pinned SG table to `nvmet_req` and execute the
 backend without the 4 KiB bounce buffer or nvmet-owned copy SG. Keep admin data
 on the copy path because its traffic is small and the simpler lifetime is
-valuable. Keep a temporary debug switch for `copy` versus `pinned` I/O so the
-same kernel can provide an A/B baseline; remove or hide it once the pinned path
-is stable.
+valuable. The temporary `copy` versus `pinned` debug switch was removed after
+the pinned path became the production implementation.
 
 The transport, not nvmet core, owns a pinned payload's SG table. Mark that
 ownership explicitly in the IOD cleanup path: do not pass the custom SG to

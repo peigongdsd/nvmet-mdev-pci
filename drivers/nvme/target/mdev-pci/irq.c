@@ -35,6 +35,7 @@ void nvmet_mdev_irq_init(struct nvmet_mdev_ctrl *ctrl)
 {
 	unsigned int vector;
 
+	spin_lock_init(&ctrl->irq_state_lock);
 	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++) {
 		struct nvmet_mdev_irq_vector *irq = &ctrl->irq_vectors[vector];
 
@@ -47,14 +48,15 @@ void nvmet_mdev_irq_init(struct nvmet_mdev_ctrl *ctrl)
 	}
 }
 
-static void nvmet_mdev_put_irq_ctx(struct nvmet_mdev_ctrl *ctrl,
-				   unsigned int vector)
+static struct eventfd_ctx *
+nvmet_mdev_replace_irq_ctx(struct nvmet_mdev_ctrl *ctrl, unsigned int vector,
+			   struct eventfd_ctx *new_ctx)
 {
-	if (!ctrl->irq_ctx[vector])
-		return;
+	struct eventfd_ctx *old_ctx = ctrl->irq_ctx[vector];
 
-	eventfd_ctx_put(ctrl->irq_ctx[vector]);
-	ctrl->irq_ctx[vector] = NULL;
+	lockdep_assert_held(&ctrl->irq_state_lock);
+	ctrl->irq_ctx[vector] = new_ctx;
+	return old_ctx;
 }
 
 void nvmet_mdev_irq_quiesce(struct nvmet_mdev_ctrl *ctrl)
@@ -74,11 +76,18 @@ void nvmet_mdev_irq_quiesce(struct nvmet_mdev_ctrl *ctrl)
 
 void nvmet_mdev_irq_cleanup(struct nvmet_mdev_ctrl *ctrl)
 {
+	struct eventfd_ctx *old_ctx[NVMET_MDEV_PCI_MSIX_VECTORS];
+	unsigned long flags;
 	unsigned int vector;
 
 	nvmet_mdev_irq_quiesce(ctrl);
+	spin_lock_irqsave(&ctrl->irq_state_lock, flags);
 	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++)
-		nvmet_mdev_put_irq_ctx(ctrl, vector);
+		old_ctx[vector] = nvmet_mdev_replace_irq_ctx(ctrl, vector, NULL);
+	spin_unlock_irqrestore(&ctrl->irq_state_lock, flags);
+	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++)
+		if (old_ctx[vector])
+			eventfd_ctx_put(old_ctx[vector]);
 }
 
 int nvmet_mdev_irq_info(struct vfio_irq_info *info)
@@ -101,6 +110,8 @@ static int nvmet_mdev_set_eventfds(struct nvmet_mdev_ctrl *ctrl,
 				   const int *fds)
 {
 	struct eventfd_ctx *new_ctx[NVMET_MDEV_PCI_MSIX_VECTORS] = {};
+	struct eventfd_ctx *old_ctx[NVMET_MDEV_PCI_MSIX_VECTORS] = {};
+	unsigned long flags;
 	unsigned int i;
 	int ret = 0;
 
@@ -115,13 +126,15 @@ static int nvmet_mdev_set_eventfds(struct nvmet_mdev_ctrl *ctrl,
 		}
 	}
 
-	mutex_lock(&ctrl->lock);
+	spin_lock_irqsave(&ctrl->irq_state_lock, flags);
 	for (i = 0; i < count; i++) {
-		nvmet_mdev_put_irq_ctx(ctrl, start + i);
-		ctrl->irq_ctx[start + i] = new_ctx[i];
+		old_ctx[i] = nvmet_mdev_replace_irq_ctx(ctrl, start + i, new_ctx[i]);
 		new_ctx[i] = NULL;
 	}
-	mutex_unlock(&ctrl->lock);
+	spin_unlock_irqrestore(&ctrl->irq_state_lock, flags);
+	for (i = 0; i < count; i++)
+		if (old_ctx[i])
+			eventfd_ctx_put(old_ctx[i]);
 	nvmet_mdev_update_pending_irqs(ctrl);
 
 out_put:
@@ -134,26 +147,32 @@ out_put:
 
 static void nvmet_mdev_disable_irqs(struct nvmet_mdev_ctrl *ctrl)
 {
+	struct eventfd_ctx *old_ctx[NVMET_MDEV_PCI_MSIX_VECTORS];
+	unsigned long flags;
 	unsigned int vector;
 
-	mutex_lock(&ctrl->lock);
+	spin_lock_irqsave(&ctrl->irq_state_lock, flags);
 	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++)
-		nvmet_mdev_put_irq_ctx(ctrl, vector);
-	mutex_unlock(&ctrl->lock);
+		old_ctx[vector] = nvmet_mdev_replace_irq_ctx(ctrl, vector, NULL);
+	spin_unlock_irqrestore(&ctrl->irq_state_lock, flags);
+	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++)
+		if (old_ctx[vector])
+			eventfd_ctx_put(old_ctx[vector]);
 }
 
 static void nvmet_mdev_trigger_irqs(struct nvmet_mdev_ctrl *ctrl,
 				    unsigned int start, unsigned int count,
 				    const u8 *trigger)
 {
+	unsigned long flags;
 	unsigned int i;
 
-	mutex_lock(&ctrl->lock);
+	spin_lock_irqsave(&ctrl->irq_state_lock, flags);
 	for (i = 0; i < count; i++) {
 		if ((!trigger || trigger[i]) && ctrl->irq_ctx[start + i])
 			eventfd_signal(ctrl->irq_ctx[start + i]);
 	}
-	mutex_unlock(&ctrl->lock);
+	spin_unlock_irqrestore(&ctrl->irq_state_lock, flags);
 }
 
 int nvmet_mdev_set_irqs(struct nvmet_mdev_ctrl *ctrl,
@@ -193,13 +212,14 @@ int nvmet_mdev_set_irqs(struct nvmet_mdev_ctrl *ctrl,
 
 void nvmet_mdev_signal_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector)
 {
+	unsigned long irq_flags;
 	u16 flags;
 	u32 vector_ctrl;
 
 	if (WARN_ON_ONCE(vector >= NVMET_MDEV_PCI_MSIX_VECTORS))
 		return;
 
-	mutex_lock(&ctrl->lock);
+	spin_lock_irqsave(&ctrl->irq_state_lock, irq_flags);
 	flags = get_unaligned_le16(ctrl->config + NVMET_MDEV_PCI_MSIX_CAP +
 				   PCI_MSIX_FLAGS);
 	vector_ctrl = get_unaligned_le32(ctrl->bar0 +
@@ -211,12 +231,12 @@ void nvmet_mdev_signal_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector)
 	    !(vector_ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT) &&
 	    ctrl->irq_ctx[vector]) {
 		eventfd_signal(ctrl->irq_ctx[vector]);
-		atomic64_inc(&ctrl->stats.interrupts);
+		nvmet_mdev_stat_inc(ctrl, interrupts);
 	} else {
 		set_bit(vector, (unsigned long *)(ctrl->bar0 +
 			NVMET_MDEV_PCI_MSIX_PBA));
 	}
-	mutex_unlock(&ctrl->lock);
+	spin_unlock_irqrestore(&ctrl->irq_state_lock, irq_flags);
 }
 
 void nvmet_mdev_notify_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector,
@@ -234,6 +254,11 @@ void nvmet_mdev_notify_irq(struct nvmet_mdev_ctrl *ctrl, unsigned int vector,
 	irq = &ctrl->irq_vectors[vector];
 	threshold = READ_ONCE(ctrl->irq_coalesce_threshold) + 1;
 	time = READ_ONCE(ctrl->irq_coalesce_time);
+	if ((force || READ_ONCE(irq->coalescing_disabled) || !time ||
+	     threshold == 1) && !READ_ONCE(irq->pending)) {
+		nvmet_mdev_signal_irq(ctrl, vector);
+		return;
+	}
 
 	spin_lock(&irq->lock);
 	if (!irq->pending)
@@ -261,10 +286,11 @@ void nvmet_mdev_update_pending_irqs(struct nvmet_mdev_ctrl *ctrl)
 {
 	unsigned long *pba = (unsigned long *)(ctrl->bar0 +
 					       NVMET_MDEV_PCI_MSIX_PBA);
+	unsigned long irq_flags;
 	u16 flags;
 	unsigned int vector;
 
-	mutex_lock(&ctrl->lock);
+	spin_lock_irqsave(&ctrl->irq_state_lock, irq_flags);
 	flags = get_unaligned_le16(ctrl->config + NVMET_MDEV_PCI_MSIX_CAP +
 				   PCI_MSIX_FLAGS);
 	if (!(flags & PCI_MSIX_FLAGS_ENABLE) ||
@@ -283,9 +309,9 @@ void nvmet_mdev_update_pending_irqs(struct nvmet_mdev_ctrl *ctrl)
 			continue;
 		clear_bit(vector, pba);
 		eventfd_signal(ctrl->irq_ctx[vector]);
-		atomic64_inc(&ctrl->stats.interrupts);
+		nvmet_mdev_stat_inc(ctrl, interrupts);
 	}
 
 out_unlock:
-	mutex_unlock(&ctrl->lock);
+	spin_unlock_irqrestore(&ctrl->irq_state_lock, irq_flags);
 }
