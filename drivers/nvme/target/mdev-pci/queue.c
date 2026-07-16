@@ -31,11 +31,11 @@ static bool pin_cache = true;
 module_param_named(pin_cache, pin_cache, bool, 0644);
 MODULE_PARM_DESC(pin_cache, "Cache pinned guest payload pages between requests");
 
-static uint pin_cache_pages = 16384;
+static uint pin_cache_pages = 65536;
 module_param_named(pin_cache_pages, pin_cache_pages, uint, 0644);
 MODULE_PARM_DESC(pin_cache_pages, "Maximum cached guest pages per controller");
 
-static uint pin_cache_max_segs = 1;
+static uint pin_cache_max_segs = 64;
 module_param_named(pin_cache_max_segs, pin_cache_max_segs, uint, 0644);
 MODULE_PARM_DESC(pin_cache_max_segs, "Maximum PRP segments admitted to the pin cache");
 
@@ -59,6 +59,15 @@ MODULE_PARM_DESC(budget_poll, "Use event-index-driven bounded DBBUF polling");
 static uint poll_budget = 128;
 module_param_named(poll_budget, poll_budget, uint, 0644);
 MODULE_PARM_DESC(poll_budget, "Maximum queues examined by one bounded DBBUF poll run");
+
+static bool fast_doorbell = true;
+module_param_named(fast_doorbell, fast_doorbell, bool, 0644);
+MODULE_PARM_DESC(fast_doorbell, "Use the allocation-free 32-bit doorbell write path");
+
+static bool cq_head_suppress = true;
+module_param_named(cq_head_suppress, cq_head_suppress, bool, 0644);
+MODULE_PARM_DESC(cq_head_suppress,
+		 "Only wake a CQ worker for head updates when publication is blocked");
 
 struct nvmet_mdev_iod {
 	struct list_head entry;
@@ -280,7 +289,28 @@ static u32 nvmet_mdev_cq_head(struct nvmet_mdev_ctrl *ctrl,
 				  (cq->qid * 2 + 1) * sizeof(u32));
 }
 
-static void nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq);
+static void __nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq);
+
+static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq, u32 head,
+				       bool force)
+{
+	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
+	unsigned long flags;
+	bool wake = false;
+
+	spin_lock_irqsave(&cq->lock, flags);
+	if (READ_ONCE(cq->live) &&
+	    (head >= cq->depth || force ||
+	     (cq->blocked && head != READ_ONCE(cq->head)))) {
+		__nvmet_mdev_queue_cq_work(cq);
+		wake = true;
+	}
+	spin_unlock_irqrestore(&cq->lock, flags);
+
+	if (wake)
+		atomic64_inc(&ctrl->stats.cq_head_wakeups);
+	return wake;
+}
 
 static void nvmet_mdev_legacy_poll(struct nvmet_mdev_ctrl *ctrl)
 {
@@ -317,8 +347,9 @@ static void nvmet_mdev_legacy_poll(struct nvmet_mdev_ctrl *ctrl)
 			}
 			if (cq->live) {
 				value = nvmet_mdev_cq_head(ctrl, cq);
-				if (value != READ_ONCE(cq->head)) {
-					nvmet_mdev_queue_cq_work(cq);
+				if (value != READ_ONCE(cq->head) &&
+				    nvmet_mdev_handle_cq_head(cq, value,
+					!ctrl->runtime.cq_head_suppress)) {
 					activity = true;
 				}
 			}
@@ -415,9 +446,13 @@ static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 		if (READ_ONCE(sq->live) && nvmet_mdev_sq_tail(ctrl, sq) !=
 		    READ_ONCE(sq->head))
 			schedule_work(&sq->work);
-		if (READ_ONCE(cq->live) && nvmet_mdev_cq_head(ctrl, cq) !=
-		    READ_ONCE(cq->head))
-			nvmet_mdev_queue_cq_work(cq);
+		if (READ_ONCE(cq->live)) {
+			u32 head = nvmet_mdev_cq_head(ctrl, cq);
+
+			if (head != READ_ONCE(cq->head))
+				nvmet_mdev_handle_cq_head(cq, head,
+					!ctrl->runtime.cq_head_suppress);
+		}
 		scanned++;
 		qid++;
 		if (qid == ctrl->nr_queues)
@@ -464,8 +499,10 @@ static void nvmet_mdev_kick_poller(struct nvmet_mdev_ctrl *ctrl)
 	mod_delayed_work(system_wq, &ctrl->poll_work, 0);
 }
 
-static void nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq)
+static void __nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq)
 {
+	lockdep_assert_held(&cq->lock);
+
 	if (atomic_cmpxchg(&cq->work_queued, 0, 1) == 0)
 		schedule_work(&cq->work);
 }
@@ -494,6 +531,8 @@ static bool nvmet_mdev_arm_cq_event(struct nvmet_mdev_ctrl *ctrl,
 	    !READ_ONCE(ctrl->dbbuf_dbs) || !READ_ONCE(ctrl->dbbuf_eis))
 		return false;
 	head = nvmet_mdev_cq_head(ctrl, cq);
+	if (head != READ_ONCE(cq->head))
+		return true;
 	WRITE_ONCE(ctrl->dbbuf_eis[cq->qid * 2 + 1], cpu_to_le32(head));
 	/* Pair with the guest's shadow-doorbell write and event-index read. */
 	mb();
@@ -506,24 +545,20 @@ static void nvmet_mdev_complete_iod(struct nvmet_mdev_iod *iod)
 	struct nvmet_mdev_ctrl *ctrl = iod->ctrl;
 	unsigned long flags;
 
-	if (ctrl->runtime.lockless_io) {
-		if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live)) {
-			nvmet_mdev_put_iod(iod);
-			return;
-		}
-	} else {
+	if (!ctrl->runtime.lockless_io)
 		mutex_lock(&ctrl->lock);
-		if (!ctrl->enabled || !cq->live) {
-			mutex_unlock(&ctrl->lock);
-			nvmet_mdev_put_iod(iod);
-			return;
-		}
-	}
 
 	spin_lock_irqsave(&cq->lock, flags);
+	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live)) {
+		spin_unlock_irqrestore(&cq->lock, flags);
+		if (!ctrl->runtime.lockless_io)
+			mutex_unlock(&ctrl->lock);
+		nvmet_mdev_put_iod(iod);
+		return;
+	}
 	list_add_tail(&iod->entry, &cq->completions);
+	__nvmet_mdev_queue_cq_work(cq);
 	spin_unlock_irqrestore(&cq->lock, flags);
-	nvmet_mdev_queue_cq_work(cq);
 	if (!ctrl->runtime.lockless_io)
 		mutex_unlock(&ctrl->lock);
 }
@@ -779,7 +814,7 @@ again:
 				mutex_unlock(&ctrl->lock);
 			goto unlock;
 		}
-		cq->head = head;
+		WRITE_ONCE(cq->head, head);
 
 		spin_lock_irqsave(&cq->lock, flags);
 		while (!list_empty(&cq->completions) &&
@@ -825,7 +860,8 @@ unlock:
 		nvmet_mdev_kick_poller(ctrl);
 
 	spin_lock_irqsave(&cq->lock, flags);
-	blocked = !list_empty(&cq->completions) &&
+	blocked = READ_ONCE(ctrl->enabled) && READ_ONCE(cq->live) &&
+		  !list_empty(&cq->completions) &&
 		  nvmet_pci_cq_full(cq->head, cq->tail, cq->depth);
 	if (READ_ONCE(ctrl->enabled) && READ_ONCE(cq->live) &&
 	    !list_empty(&cq->completions) &&
@@ -833,12 +869,28 @@ unlock:
 		spin_unlock_irqrestore(&cq->lock, flags);
 		goto again;
 	}
+	cq->blocked = blocked;
 	atomic_set(&cq->work_queued, 0);
 	spin_unlock_irqrestore(&cq->lock, flags);
-	if (ctrl->runtime.budget_poll && blocked && READ_ONCE(ctrl->enabled) &&
-	    READ_ONCE(cq->live) &&
-	    nvmet_mdev_arm_cq_event(ctrl, cq))
-		nvmet_mdev_queue_cq_work(cq);
+	if (blocked) {
+		bool advanced;
+
+		/*
+		 * A head write before blocked was published is caught here. A
+		 * later write observes blocked under cq->lock and queues the worker.
+		 */
+		if (ctrl->runtime.budget_poll && READ_ONCE(ctrl->dbbuf_dbs)) {
+			advanced = nvmet_mdev_arm_cq_event(ctrl, cq);
+		} else {
+			/* Publish blocked before checking for a racing head update. */
+			smp_mb();
+			advanced = nvmet_mdev_cq_head(ctrl, cq) !=
+				   READ_ONCE(cq->head);
+		}
+		if (advanced)
+			nvmet_mdev_handle_cq_head(cq,
+				nvmet_mdev_cq_head(ctrl, cq), false);
+	}
 }
 
 void nvmet_mdev_queue_response(struct nvmet_req *req)
@@ -885,6 +937,8 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	ctrl->runtime.direct_complete = READ_ONCE(direct_complete);
 	ctrl->runtime.lockless_io = READ_ONCE(lockless_io);
 	ctrl->runtime.budget_poll = READ_ONCE(budget_poll);
+	ctrl->runtime.fast_doorbell = READ_ONCE(fast_doorbell);
+	ctrl->runtime.cq_head_suppress = READ_ONCE(cq_head_suppress);
 	ctrl->runtime.pin_cache_pages = READ_ONCE(pin_cache_pages);
 	ctrl->runtime.pin_cache_max_segs = READ_ONCE(pin_cache_max_segs);
 	ctrl->runtime.poll_budget = max_t(unsigned int, READ_ONCE(poll_budget), 1);
@@ -925,6 +979,7 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		spin_lock_init(&cq->lock);
 		INIT_LIST_HEAD(&cq->completions);
 		atomic_set(&cq->work_queued, 0);
+		cq->blocked = false;
 		INIT_WORK(&cq->work, nvmet_mdev_cq_work);
 	}
 
@@ -936,6 +991,7 @@ static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 				       u16 vector)
 {
 	struct nvmet_mdev_cq *cq;
+	unsigned long irqflags;
 	size_t size;
 	u16 status;
 	int ret;
@@ -983,7 +1039,11 @@ static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 		cq->depth = 0;
 		goto out_unlock;
 	}
+	spin_lock_irqsave(&cq->lock, irqflags);
+	cq->blocked = false;
+	atomic_set(&cq->work_queued, 0);
 	cq->live = true;
+	spin_unlock_irqrestore(&cq->lock, irqflags);
 
 out_unlock:
 	mutex_unlock(&ctrl->lock);
@@ -1103,6 +1163,7 @@ static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 {
 	struct nvmet_mdev_cq *cq;
+	unsigned long irqflags;
 
 	lockdep_assert_held(&ctrl->state_lock);
 	if (qid >= ctrl->nr_queues)
@@ -1114,7 +1175,10 @@ static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 		mutex_unlock(&ctrl->lock);
 		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
 	}
+	spin_lock_irqsave(&cq->lock, irqflags);
 	cq->live = false;
+	cq->blocked = false;
+	spin_unlock_irqrestore(&cq->lock, irqflags);
 	mutex_unlock(&ctrl->lock);
 
 	cancel_work_sync(&cq->work);
@@ -1133,6 +1197,7 @@ static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 	cq->phase = 1;
 	cq->vector = 0;
 	cq->irq_enabled = false;
+	cq->blocked = false;
 	mutex_unlock(&ctrl->lock);
 	return NVME_SC_SUCCESS;
 }
@@ -1286,8 +1351,11 @@ void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 	if (!READ_ONCE(ctrl->enabled) || qid >= ctrl->nr_queues)
 		goto out_unlock;
 	if (cq) {
-		if (READ_ONCE(ctrl->cqs[qid].live))
-			nvmet_mdev_queue_cq_work(&ctrl->cqs[qid]);
+		struct nvmet_mdev_cq *mcq = &ctrl->cqs[qid];
+		u32 head = nvmet_mdev_cq_head(ctrl, mcq);
+
+		nvmet_mdev_handle_cq_head(mcq, head,
+					  !ctrl->runtime.cq_head_suppress);
 	} else if (READ_ONCE(ctrl->sqs[qid].live)) {
 		schedule_work(&ctrl->sqs[qid].work);
 	}

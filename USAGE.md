@@ -172,23 +172,24 @@ Restore the pinned path with `echo 1`. The performance switches are:
 | `pinned_io` | 1 | Give nvmet an SG table over guest pages instead of copying payload data. |
 | `inline_data` | 1 | Embed metadata for requests of at most 32 PRP segments. |
 | `pin_cache` | 1 | Reuse VFIO payload-page pins across requests. |
-| `pin_cache_pages` | 16384 | Bound cached pins per controller; 16384 pages is 64 MiB with 4 KiB pages. |
-| `pin_cache_max_segs` | 1 | Admit only requests at or below this PRP-segment count to the cache. |
+| `pin_cache_pages` | 65536 | Bound cached pins per controller; 65536 pages is 256 MiB with 4 KiB pages. |
+| `pin_cache_max_segs` | 64 | Admit requests with at most 64 PRP segments, covering common 128 KiB I/O. |
 | `direct_submit` | 1 | Submit a consumed SQ batch without a per-command workqueue hop. |
 | `direct_complete` | 1 | Avoid response work for cached pinned payloads when lockless I/O is active. |
 | `lockless_io` | 1 | Keep the controller mutex out of live SQ/CQ processing. |
 | `budget_poll` | 1 | Use event indices plus one bounded safety scan per idle interval. |
 | `poll_budget` | 128 | Maximum queue pairs examined by one safety scan. |
+| `fast_doorbell` | 1 | Handle exact 32-bit doorbell writes without allocating or scanning unrelated MSI-X state. |
+| `cq_head_suppress` | 1 | Wake a CQ worker for head progress only when pending completions are blocked by a full CQ. |
 
 `direct_complete` depends on `pinned_io=1`, `pin_cache=1`, and `lockless_io=1`;
 otherwise completions use response work so a softirq cannot enter the
 mutex-based controller path. `pin_cache` has no effect on the copy path. Cold
 consecutive cache misses are pinned in batches.
-The default admission limit targets repeated 4 KiB random I/O and lets larger
-sequential requests use batched request-lifetime pins, avoiding cache pollution
-and per-page cache entries for a cold stream. Raise `pin_cache_max_segs`
-deliberately when testing reuse of larger I/O. Setting either cache limit to
-zero disables caching.
+The default admission limit covers repeated 4 KiB random I/O and common
+128 KiB sequential requests. Lower `pin_cache_max_segs` deliberately when
+measuring the memory cost of large-I/O cache reuse. Setting either cache limit
+to zero disables caching.
 
 Verify the snapshot and counters on the newly created device:
 
@@ -199,7 +200,8 @@ cat "$MDEV/transport_stats"
 
 The counters include heap allocations, pin/unpin calls, cache hits/misses and
 evictions, submission/response workqueue hops, SQ/CQ batches, interrupts,
-doorbell kicks, and poll scans. They are cumulative for the mdev lifetime.
+doorbell kicks, useful CQ-head wakeups, fast doorbell writes, and poll scans.
+They are cumulative for the mdev lifetime.
 
 Useful host checks are:
 

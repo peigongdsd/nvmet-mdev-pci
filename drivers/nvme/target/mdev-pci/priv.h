@@ -95,6 +95,8 @@ struct nvmet_mdev_runtime_config {
 	bool direct_complete;
 	bool lockless_io;
 	bool budget_poll;
+	bool fast_doorbell;
+	bool cq_head_suppress;
 	unsigned int pin_cache_pages;
 	unsigned int pin_cache_max_segs;
 	unsigned int poll_budget;
@@ -125,6 +127,8 @@ struct nvmet_mdev_stats {
 	atomic64_t cq_batches;
 	atomic64_t poll_wakeups;
 	atomic64_t poll_sleeps;
+	atomic64_t fast_doorbell_writes;
+	atomic64_t cq_head_wakeups;
 };
 
 struct nvmet_mdev_ctrl;
@@ -165,6 +169,8 @@ struct nvmet_mdev_cq {
 	spinlock_t lock;
 	struct list_head completions;
 	atomic_t work_queued;
+	/* Protected by lock. */
+	bool blocked;
 	u8 *entries;
 	u16 qid;
 	u16 depth;
