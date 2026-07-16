@@ -38,7 +38,7 @@ profiles:
 
 ```sh
 # Layer 1 copy baseline
-for p in inline_data pin_cache direct_submit direct_complete lockless_io budget_poll fast_doorbell cq_head_suppress; do
+for p in inline_data pin_cache direct_submit direct_complete lockless_io budget_poll fast_doorbell msix_scan_suppress cq_head_suppress; do
 	echo 0 | sudo tee "/sys/module/nvmet_mdev_pci/parameters/$p"
 done
 echo 0 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pinned_io
@@ -54,6 +54,7 @@ echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/direct_complete
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/lockless_io
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/budget_poll
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/fast_doorbell
+echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/msix_scan_suppress
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/cq_head_suppress
 ```
 

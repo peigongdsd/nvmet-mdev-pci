@@ -44,7 +44,8 @@ mdev, then recreate the mdev and confirm `$MDEV/runtime_config`.
 | `direct_complete` | Response work adds another scheduling hop. | With cached pins and lockless I/O, `response_work_hops` becomes zero. |
 | `lockless_io` | `ctrl->lock` serializes hot SQ/CQ paths. | Four-job scaling and task-clock per I/O improve without correctness changes. |
 | `budget_poll` | Adaptive busy polling wastes host cores. | `poll_queue_checks` per command falls without a QD1 latency regression. |
-| `fast_doorbell` | Allocating a buffer and scanning MSI-X state on every 32-bit doorbell wastes CPU. | `fast_doorbell_writes` tracks trapped kicks while allocation profiles and kernel CPU fall. |
+| `fast_doorbell` | Allocating a buffer for every 32-bit doorbell wastes CPU. | `fast_doorbell_writes` tracks allocation-free trapped kicks while allocation profiles and kernel CPU fall. |
+| `msix_scan_suppress` | Scanning all pending MSI-X vectors after unrelated MMIO wastes CPU. | IRQ delivery is unchanged while samples in the pending-vector scan fall. |
 | `cq_head_suppress` | Guest CQ-head writes wake workers even when no completion is blocked. | `cq_head_wakeups` and `cq_work_runs` fall while completion counts remain unchanged. |
 
 Measure a copy baseline, a request-lifetime pinned baseline, each switch added

@@ -329,12 +329,14 @@ static ssize_t runtime_config_show(struct device *dev,
 	return sysfs_emit(buf,
 		"pinned_io %u\ninline_data %u\npin_cache %u\n"
 		"direct_submit %u\ndirect_complete %u\nlockless_io %u\n"
-		"budget_poll %u\nfast_doorbell %u\ncq_head_suppress %u\n"
+		"budget_poll %u\nfast_doorbell %u\nmsix_scan_suppress %u\n"
+		"cq_head_suppress %u\n"
 		"pin_cache_pages %u\n"
 		"pin_cache_max_segs %u\npoll_budget %u\n",
 		cfg->pinned_io, cfg->inline_data, cfg->pin_cache,
 		cfg->direct_submit, cfg->direct_complete, cfg->lockless_io,
-		cfg->budget_poll, cfg->fast_doorbell, cfg->cq_head_suppress,
+		cfg->budget_poll, cfg->fast_doorbell, cfg->msix_scan_suppress,
+		cfg->cq_head_suppress,
 		cfg->pin_cache_pages, cfg->pin_cache_max_segs,
 		cfg->poll_budget);
 }

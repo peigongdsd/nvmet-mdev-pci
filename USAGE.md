@@ -179,7 +179,8 @@ Restore the pinned path with `echo 1`. The performance switches are:
 | `lockless_io` | 1 | Keep the controller mutex out of live SQ/CQ processing. |
 | `budget_poll` | 1 | Use event indices plus one bounded safety scan per idle interval. |
 | `poll_budget` | 128 | Maximum queue pairs examined by one safety scan. |
-| `fast_doorbell` | 1 | Handle exact 32-bit doorbell writes without allocating or scanning unrelated MSI-X state. |
+| `fast_doorbell` | 1 | Handle exact 32-bit doorbell writes without allocating a temporary buffer. |
+| `msix_scan_suppress` | 1 | Scan pending MSI-X vectors only when writes can change MSI-X mask or table state. |
 | `cq_head_suppress` | 1 | Wake a CQ worker for head progress only when pending completions are blocked by a full CQ. |
 
 `direct_complete` depends on `pinned_io=1`, `pin_cache=1`, and `lockless_io=1`;
