@@ -165,12 +165,16 @@ mdev before testing a new value.
 | `pin_cache_pages` | 65536 | Bound cached pins per controller; 65536 pages is 256 MiB with 4 KiB pages. |
 | `pin_cache_max_segs` | 64 | Admit requests with at most 64 PRP segments, covering common 128 KiB I/O. |
 | `poll_budget` | 128 | Maximum queue pairs examined by one safety scan. |
+| `response_workers` | 0 | Response cleanup workers per I/O SQ; 0 selects an automatic count, while 1 serializes cleanup. |
 
 Cold consecutive cache misses are pinned in batches. Setting either cache
 limit to zero disables caching while retaining request-lifetime pinned I/O.
 The default admission limit covers repeated 4 KiB random I/O and common
 128 KiB sequential requests. Lower `pin_cache_max_segs` deliberately when
 measuring the memory cost of large-I/O cache reuse.
+Use `response_workers=1` to measure serialized cleanup. Automatic mode uses up
+to one worker per online CPU, capped by SQ depth and 64; an explicit value is
+clamped to the same bounds. The admin SQ always uses one ordered worker.
 
 Verify the snapshot and counters on the newly created device:
 

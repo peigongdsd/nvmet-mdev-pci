@@ -11,8 +11,9 @@ Small requests use inline metadata and the pin cache is bounded per controller.
 The latest CPU patch removes the old implementation-choice module switches and
 makes the measured fast paths unconditional. Hot counters are per-CPU, MSI-X is
 signalled directly when NVMe coalescing is inactive, non-cached responses are
-cleaned in per-SQ batches, and completed IODs retain lazily grown PRP and payload
-metadata in a bounded recycle cache. Uncached request pins run concurrently;
+cleaned by independently batched per-SQ worker lanes, and completed IODs retain
+lazily grown PRP and payload metadata in a bounded recycle cache. Uncached
+request pins run concurrently;
 the DMA-unmap path takes an exclusive admission gate before inspecting active
 payloads. Cache xarray/LRU mutation remains serialized.
 
@@ -41,10 +42,14 @@ snapshotted when an mdev controller is created:
 | `pin_cache_pages` | 65536 | Maximum persistent guest-page pins per controller. |
 | `pin_cache_max_segs` | 64 | Maximum PRP segments admitted to the persistent pin cache. |
 | `poll_budget` | 128 | Maximum queue pairs examined by one safety poll. |
+| `response_workers` | 0 | Response cleanup workers per I/O SQ; 0 is automatic and 1 forces serialization. |
 
 Setting either cache limit to zero disables persistent cache entries but keeps
 request-lifetime pinned I/O. The default cache holds 256 MiB with 4 KiB pages
 and covers common 128 KiB requests, including an unaligned first PRP.
+Automatic response-worker sizing is capped by SQ depth, online CPUs, and a
+maximum of 64. Explicit values are capped by SQ depth and 64. The admin SQ
+remains ordered with one worker.
 
 `poll_runs` counts poll function iterations and `poll_queue_checks` counts
 queue-pair loop iterations. `pinned_io_bytes` includes cache hits; actual pin

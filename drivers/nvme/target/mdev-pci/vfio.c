@@ -344,9 +344,10 @@ static ssize_t runtime_config_show(struct device *dev,
 	cfg = &ctrl->runtime;
 	return sysfs_emit(buf,
 		"pin_cache_pages %u\n"
-		"pin_cache_max_segs %u\npoll_budget %u\n",
+		"pin_cache_max_segs %u\npoll_budget %u\n"
+		"response_workers %u\n",
 		cfg->pin_cache_pages, cfg->pin_cache_max_segs,
-		cfg->poll_budget);
+		cfg->poll_budget, cfg->response_workers);
 }
 static DEVICE_ATTR_RO(runtime_config);
 
