@@ -285,7 +285,8 @@ static ssize_t transport_stats_show(struct device *dev,
 		"payload_dma_lock_contentions %lld\nsubmit_work_hops %lld\n"
 		"response_work_hops %lld\nsq_work_runs %lld\ncq_work_runs %lld\n"
 		"sq_batches %lld\ncq_batches %lld\npoll_wakeups %lld\n"
-		"poll_sleeps %lld\npin_cache_pages_current %u\n",
+		"poll_sleeps %lld\nfast_doorbell_writes %lld\n"
+		"cq_head_wakeups %lld\npin_cache_pages_current %u\n",
 		atomic64_read(&ctrl->stats.commands),
 		atomic64_read(&ctrl->stats.pinned_io_bytes),
 		atomic64_read(&ctrl->stats.completions),
@@ -310,6 +311,8 @@ static ssize_t transport_stats_show(struct device *dev,
 		atomic64_read(&ctrl->stats.cq_batches),
 		atomic64_read(&ctrl->stats.poll_wakeups),
 		atomic64_read(&ctrl->stats.poll_sleeps),
+		atomic64_read(&ctrl->stats.fast_doorbell_writes),
+		atomic64_read(&ctrl->stats.cq_head_wakeups),
 		READ_ONCE(ctrl->pin_cache_nr_pages));
 }
 static DEVICE_ATTR_RO(transport_stats);
@@ -326,11 +329,13 @@ static ssize_t runtime_config_show(struct device *dev,
 	return sysfs_emit(buf,
 		"pinned_io %u\ninline_data %u\npin_cache %u\n"
 		"direct_submit %u\ndirect_complete %u\nlockless_io %u\n"
-		"budget_poll %u\npin_cache_pages %u\n"
+		"budget_poll %u\nfast_doorbell %u\ncq_head_suppress %u\n"
+		"pin_cache_pages %u\n"
 		"pin_cache_max_segs %u\npoll_budget %u\n",
 		cfg->pinned_io, cfg->inline_data, cfg->pin_cache,
 		cfg->direct_submit, cfg->direct_complete, cfg->lockless_io,
-		cfg->budget_poll, cfg->pin_cache_pages, cfg->pin_cache_max_segs,
+		cfg->budget_poll, cfg->fast_doorbell, cfg->cq_head_suppress,
+		cfg->pin_cache_pages, cfg->pin_cache_max_segs,
 		cfg->poll_budget);
 }
 static DEVICE_ATTR_RO(runtime_config);

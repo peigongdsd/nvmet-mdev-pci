@@ -38,7 +38,7 @@ profiles:
 
 ```sh
 # Layer 1 copy baseline
-for p in inline_data pin_cache direct_submit direct_complete lockless_io budget_poll; do
+for p in inline_data pin_cache direct_submit direct_complete lockless_io budget_poll fast_doorbell cq_head_suppress; do
 	echo 0 | sudo tee "/sys/module/nvmet_mdev_pci/parameters/$p"
 done
 echo 0 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pinned_io
@@ -53,10 +53,15 @@ echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/direct_submit
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/direct_complete
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/lockless_io
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/budget_poll
+echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/fast_doorbell
+echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/cq_head_suppress
 ```
 
 `direct_complete` only takes its fast path when `pinned_io`, `pin_cache`, and
 `lockless_io` are also enabled. `pin_cache` is irrelevant when `pinned_io=0`.
+The default pin cache is 65536 pages and admits up to 64 PRP segments per
+request. Record `fast_doorbell_writes`, `cq_head_wakeups`, and `cq_work_runs`
+when comparing the notification switches.
 Use identical guest images, namespace sizes, fio versions, CPU affinity, and
 cache warmup for all runs. Cache hit rate must be reported alongside IOPS: a
 small cache and a large uniform-random working set can otherwise make the

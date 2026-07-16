@@ -44,15 +44,17 @@ mdev, then recreate the mdev and confirm `$MDEV/runtime_config`.
 | `direct_complete` | Response work adds another scheduling hop. | With cached pins and lockless I/O, `response_work_hops` becomes zero. |
 | `lockless_io` | `ctrl->lock` serializes hot SQ/CQ paths. | Four-job scaling and task-clock per I/O improve without correctness changes. |
 | `budget_poll` | Adaptive busy polling wastes host cores. | `poll_queue_checks` per command falls without a QD1 latency regression. |
+| `fast_doorbell` | Allocating a buffer and scanning MSI-X state on every 32-bit doorbell wastes CPU. | `fast_doorbell_writes` tracks trapped kicks while allocation profiles and kernel CPU fall. |
+| `cq_head_suppress` | Guest CQ-head writes wake workers even when no completion is blocked. | `cq_head_wakeups` and `cq_work_runs` fall while completion counts remain unchanged. |
 
 Measure a copy baseline, a request-lifetime pinned baseline, each switch added
 individually in the order above, and the all-on profile. For `pin_cache`, report
 both a cold run and an identical warm run, cache hit rate, and the random
-working-set size. A 64 MiB default cache is deliberately bounded and is not
-expected to help a uniform-random workload spanning several GiB after only one
-pass; increase `pin_cache_pages` as a separate capacity experiment. The default
-`pin_cache_max_segs=1` admits 4 KiB requests and bypasses larger sequential I/O;
-raise it separately when measuring cache reuse for larger requests.
+working-set size. The default cache holds 65536 pages, or 256 MiB with 4 KiB
+pages, and admits requests with up to 64 PRP segments. This covers common
+128 KiB requests, including an unaligned first PRP, while retaining a strict
+per-controller memory bound. Compare cold and warm runs and lower the capacity
+separately when measuring memory/performance tradeoffs.
 
 `poll_runs` counts poll function iterations and `poll_queue_checks` counts
 queue-pair loop iterations, including event publication and race checks. Both
@@ -60,6 +62,10 @@ polling modes use those definitions, so their
 deltas can be compared directly. `pinned_io_bytes` is the amount of command
 payload handled by the pinned path, including cache hits; actual pinning cost
 is represented by `pin_calls`, `unpin_calls`, and the cache counters.
+`fast_doorbell_writes` counts exact aligned 32-bit BAR doorbells handled without
+a heap allocation. `cq_head_wakeups` counts CQ-head notifications that actually
+needed a worker because suppression was disabled, the head was invalid, or a
+full CQ had pending completions.
 The payload pin/cache metadata remains protected by one controller-wide mutex.
 Use `payload_dma_lock_contentions` to decide whether cache sharding or a
 two-phase pin insertion scheme is justified; the current batch does not claim
