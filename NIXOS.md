@@ -7,7 +7,7 @@ must come from the same kernel build.
 
 The flake exports:
 
-- `packages.x86_64-linux.kernel`: the patched 7.2-rc kernel;
+- `packages.x86_64-linux.kernel`: the patched 7.1.y kernel;
 - `legacyPackages.x86_64-linux.kernelPackages`: its package set;
 - `nixosModules.default`: selects that package set and loads
   `nvmet-mdev-pci` during boot.
@@ -41,11 +41,11 @@ Remove or comment out the existing `boot.kernelPackages` assignment in
 `hardware-configuration.nix`; the imported module supplies it with
 `lib.mkForce`.
 
-The pinned nixpkgs currently calls the release-candidate package set
-`linuxPackages_testing`, not `linuxPackages_nightly`. It resolves to 7.2-rc3;
-`linuxPackages_latest` resolves to 7.1.3. The module uses
-`linuxPackages_testing` as its base and replaces its source with this exact
-repository, which is based on 7.2-rc3 plus the nvmet mdev work.
+The pinned nixpkgs exposes Linux 7.1.3 as `linuxPackages_latest`. The module
+uses that package as its configuration and toolchain base, then replaces its
+source with this exact repository. The backport branch tracks the official
+stable `linux-7.1.y` branch and currently carries the nvmet mdev work on top of
+Linux 7.1.3.
 
 ## Build and activate
 

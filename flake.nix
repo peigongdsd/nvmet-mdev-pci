@@ -10,14 +10,14 @@
       pkgs = import nixpkgs { inherit system; };
       mkNvmetKernel = kernelPkgs:
         let
-          base = kernelPkgs.linuxPackages_testing.kernel;
-          version = "7.2-rc3-nvmet-mdev-pci";
+          base = kernelPkgs.linuxPackages_latest.kernel;
+          version = "7.1.3-nvmet-mdev-pci";
         in
         base.override {
           argsOverride = {
             pname = "linux-nvmet-mdev-pci";
             inherit version;
-            modDirVersion = "7.2.0-rc3";
+            modDirVersion = "7.1.3";
             src = self;
             structuredExtraConfig = with kernelPkgs.lib.kernel; {
               BLK_DEV_NVME = module;

@@ -1,6 +1,6 @@
 # nvmet mdev PCI development
 
-This tree tracks Linux 7.2-rc and develops an in-kernel VFIO mediated NVMe
+This tree tracks Linux 7.1.y and develops an in-kernel VFIO mediated NVMe
 PCI target backed by `nvmet`. The initial work separates an nvmet transport's
 configfs implementation name from its NVMe transport type so that the physical
 PCI endpoint and mediated PCI implementations can coexist.

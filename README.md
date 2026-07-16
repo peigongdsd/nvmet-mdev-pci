@@ -9,5 +9,5 @@ namespace and backend implementation.
 - [Performance design and acceptance gates](PERFORMANCE.md)
 - [Benchmark procedure](tools/testing/nvmet-mdev-pci/BENCHMARK.md)
 
-The current development target is Linux 7.2-rc3. Ordinary guest memory is
+The backport target is the stable Linux 7.1.y series. Ordinary guest memory is
 supported; SPDK and hugetlbfs are not required.
