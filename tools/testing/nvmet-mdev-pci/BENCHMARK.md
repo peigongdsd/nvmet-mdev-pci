@@ -19,9 +19,9 @@ host-bench.sh QEMU_PID /sys/bus/mdev/devices/UUID results/host 660
 ```
 
 The host collector saves both `transport_stats` and `runtime_config`. The first
-reports commands, allocation and pin-cache behavior, workqueue hops, actual
-eventfd interrupts, trapped doorbell kicks, and shadow-doorbell poll activity.
-The second makes the active runtime-switch snapshot part of the result.
+reports commands, allocation and pin-cache behavior, response batching, IOD
+reuse, actual eventfd interrupts, trapped doorbell kicks, and shadow-doorbell
+poll activity. The second records the active capacity and polling policy.
 Use counter deltas for each run. `poll_runs` is the number of poll iterations,
 while `poll_queue_checks` is the number of queue-pair loop iterations, including
 event publication and race checks; neither is a time measurement.
@@ -29,40 +29,25 @@ event publication and race checks; neither is a time measurement.
 `pin_cache_permission_fallbacks` reports requests retried with direction-specific
 request-lifetime pins because a bidirectional cache pin was not permitted.
 `payload_dma_lock_contentions` counts payload requests that could not acquire
-the controller-wide pin/cache mutex immediately.
+the shared pin/cache metadata mutex immediately. Uncached request-lifetime
+pins run in parallel behind the DMA invalidation gate.
 
-For an A/B comparison, stop QEMU and remove the mdev, change module parameters,
-then create a fresh mdev. Parameters are snapshotted when a controller object is
-created; changing them does not mutate an existing controller. Start with these
-profiles:
+Implementation-choice A/B switches have been removed. To compare cache sizing
+or poll budgets, stop QEMU and remove the mdev, change the relevant parameter,
+then create a fresh mdev. Parameters are snapshotted when the controller object
+is created:
 
 ```sh
-# Layer 1 copy baseline
-for p in inline_data pin_cache direct_submit direct_complete lockless_io budget_poll fast_doorbell msix_scan_suppress cq_head_suppress; do
-	echo 0 | sudo tee "/sys/module/nvmet_mdev_pci/parameters/$p"
-done
-echo 0 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pinned_io
-
-# Request-lifetime pinned baseline
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pinned_io
-
-# Enable one optimization at a time, then remove and recreate the mdev.
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/inline_data
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pin_cache
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/direct_submit
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/direct_complete
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/lockless_io
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/budget_poll
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/fast_doorbell
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/msix_scan_suppress
-echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/cq_head_suppress
+echo 32768 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pin_cache_pages
+echo 32 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pin_cache_max_segs
+echo 64 | sudo tee /sys/module/nvmet_mdev_pci/parameters/poll_budget
 ```
 
-`direct_complete` only takes its fast path when `pinned_io`, `pin_cache`, and
-`lockless_io` are also enabled. `pin_cache` is irrelevant when `pinned_io=0`.
 The default pin cache is 65536 pages and admits up to 64 PRP segments per
-request. Record `fast_doorbell_writes`, `cq_head_wakeups`, and `cq_work_runs`
-when comparing the notification switches.
+request. Setting either cache limit to zero measures request-lifetime pinning
+without persistent cache entries. Record `response_work_runs`,
+`response_batches`, `response_items`, `iod_cache_hits`, and `iod_cache_misses`
+alongside the existing queue and pin counters.
 Use identical guest images, namespace sizes, fio versions, CPU affinity, and
 cache warmup for all runs. Cache hit rate must be reported alongside IOPS: a
 small cache and a large uniform-random working set can otherwise make the

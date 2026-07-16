@@ -34,13 +34,14 @@ static void nvmet_mdev_unpin(struct nvmet_mdev_ctrl *ctrl, u64 iova,
 
 		vfio_unpin_pages(&ctrl->vdev, iova + ((u64)done << PAGE_SHIFT),
 				 batch);
-		atomic64_inc(&ctrl->stats.unpin_calls);
+		nvmet_mdev_stat_inc(ctrl, unpin_calls);
 		done += batch;
 	}
 }
 
 void nvmet_mdev_iova_init(struct nvmet_mdev_ctrl *ctrl)
 {
+	init_rwsem(&ctrl->dma_pin_lock);
 	mutex_init(&ctrl->dma_lock);
 	INIT_LIST_HEAD(&ctrl->payloads);
 	INIT_LIST_HEAD(&ctrl->pin_cache_lru);
@@ -65,7 +66,7 @@ static bool nvmet_mdev_cache_evict_one(struct nvmet_mdev_ctrl *ctrl)
 		xa_erase(&ctrl->pin_cache, entry->iova >> PAGE_SHIFT);
 		list_del(&entry->lru);
 		ctrl->pin_cache_nr_pages--;
-		atomic64_inc(&ctrl->stats.pin_cache_evictions);
+	nvmet_mdev_stat_inc(ctrl, pin_cache_evictions);
 		nvmet_mdev_cache_entry_free(ctrl, entry);
 		return true;
 	}
@@ -108,6 +109,7 @@ void nvmet_mdev_iova_reset(struct nvmet_mdev_ctrl *ctrl)
 	struct nvmet_mdev_pin_cache_entry *entry;
 	unsigned long index;
 
+	down_write(&ctrl->dma_pin_lock);
 	mutex_lock(&ctrl->dma_lock);
 	xa_for_each(&ctrl->pin_cache, index, entry) {
 		if (WARN_ON_ONCE(refcount_read(&entry->refs) != 1))
@@ -119,6 +121,7 @@ void nvmet_mdev_iova_reset(struct nvmet_mdev_ctrl *ctrl)
 	}
 	WARN_ON_ONCE(ctrl->pin_cache_nr_pages || !xa_empty(&ctrl->pin_cache));
 	mutex_unlock(&ctrl->dma_lock);
+	up_write(&ctrl->dma_pin_lock);
 }
 
 void nvmet_mdev_iova_cleanup(struct nvmet_mdev_ctrl *ctrl)
@@ -195,7 +198,7 @@ int nvmet_mdev_map_guest(struct nvmet_mdev_ctrl *ctrl, u64 iova,
 		ret = vfio_pin_pages(&ctrl->vdev,
 				     mapping->iova + ((u64)pinned << PAGE_SHIFT),
 				     batch, prot, &mapping->pages[pinned]);
-		atomic64_inc(&ctrl->stats.pin_calls);
+		nvmet_mdev_stat_inc(ctrl, pin_calls);
 		if (ret != batch) {
 			if (ret > 0)
 				pinned += ret;
@@ -257,14 +260,9 @@ static void nvmet_mdev_payload_release(struct nvmet_mdev_ctrl *ctrl,
 			nvmet_mdev_unpin(ctrl, run->iova, run->npages);
 		}
 	}
-	if (payload->sgt.sgl != payload->inline_sg)
-		sg_free_table(&payload->sgt);
-	if (payload->runs != payload->inline_runs)
-		kfree(payload->runs);
-	if (payload->pages != payload->inline_pages)
-		kfree(payload->pages);
-	if (payload->cache_entries != payload->inline_cache_entries)
-		kfree(payload->cache_entries);
+	payload->sgt.sgl = NULL;
+	payload->sgt.nents = 0;
+	payload->sgt.orig_nents = 0;
 	payload->runs = NULL;
 	payload->pages = NULL;
 	payload->cache_entries = NULL;
@@ -272,15 +270,79 @@ static void nvmet_mdev_payload_release(struct nvmet_mdev_ctrl *ctrl,
 	payload->nr_entries = 0;
 }
 
+void nvmet_mdev_payload_destroy(struct nvmet_mdev_payload *payload)
+{
+	struct nvmet_mdev_payload_backing *backing = &payload->backing;
+
+	if (backing->sgt.sgl)
+		sg_free_table(&backing->sgt);
+	kfree(backing->runs);
+	kfree(backing->pages);
+	kfree(backing->cache_entries);
+	memset(backing, 0, sizeof(*backing));
+}
+
+static int nvmet_mdev_payload_grow(struct nvmet_mdev_ctrl *ctrl,
+				   struct nvmet_mdev_payload *payload,
+				   unsigned int nr_segments, bool cached)
+{
+	struct nvmet_mdev_payload_backing *backing = &payload->backing;
+
+	if (backing->capacity < nr_segments) {
+		struct sg_table new_sgt;
+		struct page **new_pages;
+		int ret;
+
+		ret = sg_alloc_table(&new_sgt, nr_segments, GFP_KERNEL);
+		if (ret)
+			return ret;
+		new_pages = kcalloc(nr_segments, sizeof(*new_pages), GFP_KERNEL);
+		if (!new_pages) {
+			sg_free_table(&new_sgt);
+			return -ENOMEM;
+		}
+		if (backing->sgt.sgl)
+			sg_free_table(&backing->sgt);
+		kfree(backing->pages);
+		backing->sgt = new_sgt;
+		backing->pages = new_pages;
+		backing->capacity = nr_segments;
+		nvmet_mdev_stat_inc(ctrl, payload_sg_heap_allocs);
+	}
+
+	if (cached && backing->cache_entries_capacity < nr_segments) {
+		struct nvmet_mdev_pin_cache_entry **entries;
+
+		entries = kcalloc(nr_segments, sizeof(*entries), GFP_KERNEL);
+		if (!entries)
+			return -ENOMEM;
+		kfree(backing->cache_entries);
+		backing->cache_entries = entries;
+		backing->cache_entries_capacity = nr_segments;
+	} else if (!cached && backing->runs_capacity < nr_segments) {
+		struct nvmet_mdev_pin_run *runs;
+
+		runs = kcalloc(nr_segments, sizeof(*runs), GFP_KERNEL);
+		if (!runs)
+			return -ENOMEM;
+		kfree(backing->runs);
+		backing->runs = runs;
+		backing->runs_capacity = nr_segments;
+	}
+
+	return 0;
+}
+
 static int nvmet_mdev_payload_alloc(struct nvmet_mdev_ctrl *ctrl,
 				    struct nvmet_mdev_payload *payload,
 				    unsigned int nr_segments, bool cached)
 {
-	bool inline_data = ctrl->runtime.inline_data &&
-			   nr_segments <= NVMET_MDEV_INLINE_SEGS;
+	struct nvmet_mdev_payload_backing backing = payload->backing;
+	bool inline_data = nr_segments <= NVMET_MDEV_INLINE_SEGS;
 	int ret;
 
 	memset(payload, 0, sizeof(*payload));
+	payload->backing = backing;
 	INIT_LIST_HEAD(&payload->entry);
 	payload->cached = cached;
 	if (inline_data) {
@@ -289,42 +351,106 @@ static int nvmet_mdev_payload_alloc(struct nvmet_mdev_ctrl *ctrl,
 		payload->sgt.nents = nr_segments;
 		payload->sgt.orig_nents = nr_segments;
 	} else {
-		ret = sg_alloc_table(&payload->sgt, nr_segments, GFP_KERNEL);
+		ret = nvmet_mdev_payload_grow(ctrl, payload, nr_segments, cached);
 		if (ret)
 			return ret;
-		atomic64_inc(&ctrl->stats.payload_sg_heap_allocs);
+		payload->sgt = payload->backing.sgt;
+		payload->sgt.nents = nr_segments;
+		payload->sgt.orig_nents = nr_segments;
 	}
 
 	if (cached) {
 		payload->cache_entries = inline_data ?
 			payload->inline_cache_entries :
-			kcalloc(nr_segments, sizeof(*payload->cache_entries),
-				GFP_KERNEL);
+			payload->backing.cache_entries;
 		payload->pages = inline_data ? payload->inline_pages :
-			kcalloc(nr_segments, sizeof(*payload->pages), GFP_KERNEL);
-		if (!payload->cache_entries || !payload->pages)
-			goto free_arrays;
+			payload->backing.pages;
 	} else {
 		payload->runs = inline_data ? payload->inline_runs :
-			kcalloc(nr_segments, sizeof(*payload->runs), GFP_KERNEL);
+			payload->backing.runs;
 		payload->pages = inline_data ? payload->inline_pages :
-			kcalloc(nr_segments, sizeof(*payload->pages), GFP_KERNEL);
-		if (!payload->runs || !payload->pages)
-			goto free_arrays;
+			payload->backing.pages;
 	}
 	return 0;
+}
 
-free_arrays:
-	if (payload->runs != payload->inline_runs)
-		kfree(payload->runs);
-	if (payload->pages != payload->inline_pages)
-		kfree(payload->pages);
-	if (payload->cache_entries != payload->inline_cache_entries)
-		kfree(payload->cache_entries);
-	if (payload->sgt.sgl != payload->inline_sg)
-		sg_free_table(&payload->sgt);
-	memset(payload, 0, sizeof(*payload));
-	return -ENOMEM;
+static int
+nvmet_mdev_pin_uncached(struct nvmet_mdev_ctrl *ctrl,
+			const struct nvmet_mdev_iova_segment *segments,
+			unsigned int nr_segments, int prot,
+			struct nvmet_mdev_payload *payload)
+{
+	struct scatterlist *sg = payload->sgt.sgl;
+	u64 bytes = 0;
+	unsigned int first = 0;
+	int ret;
+
+	down_read(&ctrl->dma_pin_lock);
+	if (!mutex_trylock(&ctrl->dma_lock)) {
+		nvmet_mdev_stat_inc(ctrl, payload_dma_lock_contentions);
+		mutex_lock(&ctrl->dma_lock);
+	}
+	if (!READ_ONCE(ctrl->enabled) || ctrl->dma_blocked) {
+		mutex_unlock(&ctrl->dma_lock);
+		ret = -ENODEV;
+		goto release;
+	}
+	mutex_unlock(&ctrl->dma_lock);
+
+	while (first < nr_segments) {
+		unsigned int count = 1;
+		u64 base = round_down(segments[first].iova, PAGE_SIZE);
+		unsigned int i;
+
+		while (first + count < nr_segments &&
+		       count < VFIO_PIN_PAGES_MAX_ENTRIES &&
+		       round_down(segments[first + count].iova, PAGE_SIZE) ==
+			base + ((u64)count << PAGE_SHIFT))
+			count++;
+
+		ret = vfio_pin_pages(&ctrl->vdev, base, count, prot,
+				     &payload->pages[first]);
+		nvmet_mdev_stat_inc(ctrl, pin_calls);
+		if (ret != count) {
+			if (ret > 0) {
+				payload->runs[payload->nr_runs].iova = base;
+				payload->runs[payload->nr_runs].npages = ret;
+				payload->nr_runs++;
+				ret = -EFAULT;
+			} else if (!ret) {
+				ret = -EFAULT;
+			}
+			goto release;
+		}
+
+		payload->runs[payload->nr_runs].iova = base;
+		payload->runs[payload->nr_runs].npages = count;
+		payload->nr_runs++;
+		for (i = 0; i < count; i++) {
+			sg_set_page(sg, payload->pages[first + i],
+				    segments[first + i].length,
+				    offset_in_page(segments[first + i].iova));
+			sg = sg_next(sg);
+		}
+		first += count;
+	}
+
+	mutex_lock(&ctrl->dma_lock);
+	list_add_tail(&payload->entry, &ctrl->payloads);
+	payload->active = true;
+	mutex_unlock(&ctrl->dma_lock);
+	up_read(&ctrl->dma_pin_lock);
+
+	for (first = 0; first < nr_segments; first++)
+		bytes += segments[first].length;
+	nvmet_mdev_stat_add(ctrl, pinned_io_bytes, bytes);
+	return 0;
+
+release:
+	payload->active = false;
+	nvmet_mdev_payload_release(ctrl, payload);
+	up_read(&ctrl->dma_pin_lock);
+	return ret;
 }
 
 static int
@@ -343,166 +469,112 @@ nvmet_mdev_pin_payload_mode(struct nvmet_mdev_ctrl *ctrl,
 	ret = nvmet_mdev_payload_alloc(ctrl, payload, nr_segments, cached);
 	if (ret)
 		return ret;
+	if (!cached)
+		return nvmet_mdev_pin_uncached(ctrl, segments, nr_segments, prot,
+					       payload);
 	sg = payload->sgt.sgl;
 
+	down_read(&ctrl->dma_pin_lock);
 	if (!mutex_trylock(&ctrl->dma_lock)) {
-		atomic64_inc(&ctrl->stats.payload_dma_lock_contentions);
+		nvmet_mdev_stat_inc(ctrl, payload_dma_lock_contentions);
 		mutex_lock(&ctrl->dma_lock);
 	}
 	if (!READ_ONCE(ctrl->enabled) || ctrl->dma_blocked) {
 		ret = -ENODEV;
 		goto unlock_release;
 	}
-	if (cached) {
-		while (first < nr_segments) {
-			struct nvmet_mdev_pin_cache_entry *entry;
-			u64 base = round_down(segments[first].iova, PAGE_SIZE);
-			unsigned int count = 1;
-			unsigned int i;
-
-			entry = xa_load(&ctrl->pin_cache, base >> PAGE_SHIFT);
-			if (entry) {
-				refcount_inc(&entry->refs);
-				list_move(&entry->lru, &ctrl->pin_cache_lru);
-				payload->cache_entries[payload->nr_entries++] = entry;
-				sg_set_page(sg, entry->page, segments[first].length,
-					    offset_in_page(segments[first].iova));
-				sg = sg_next(sg);
-				atomic64_inc(&ctrl->stats.pin_cache_hits);
-				first++;
-				continue;
-			}
-
-			while (first + count < nr_segments &&
-			       count < VFIO_PIN_PAGES_MAX_ENTRIES &&
-			       round_down(segments[first + count].iova, PAGE_SIZE) ==
-				base + ((u64)count << PAGE_SHIFT) &&
-			       !xa_load(&ctrl->pin_cache,
-					(base >> PAGE_SHIFT) + count))
-				count++;
-
-			ret = vfio_pin_pages(&ctrl->vdev, base, count,
-					     IOMMU_READ | IOMMU_WRITE,
-					     &payload->pages[first]);
-			atomic64_inc(&ctrl->stats.pin_calls);
-			if (ret != count) {
-				bool permission_error = ret == -EPERM;
-
-				if (ret > 0)
-					nvmet_mdev_unpin(ctrl, base, ret);
-				ret = permission_error ? -EACCES :
-					(ret < 0 ? ret : -EFAULT);
-				goto unlock_cached;
-			}
-
-			for (i = 0; i < count; i++) {
-				while (ctrl->pin_cache_nr_pages >=
-				       ctrl->runtime.pin_cache_pages &&
-				       nvmet_mdev_cache_evict_one(ctrl))
-					;
-
-				entry = kzalloc_obj(*entry);
-				if (!entry) {
-					nvmet_mdev_unpin(ctrl,
-							 base + ((u64)i << PAGE_SHIFT),
-							 count - i);
-					ret = -ENOMEM;
-					goto unlock_cached;
-				}
-				entry->iova = base + ((u64)i << PAGE_SHIFT);
-				entry->page = payload->pages[first + i];
-				refcount_set(&entry->refs, 2);
-				INIT_LIST_HEAD(&entry->lru);
-				ret = xa_err(xa_store(&ctrl->pin_cache,
-						      entry->iova >> PAGE_SHIFT,
-						      entry, GFP_KERNEL));
-				if (ret) {
-					refcount_set(&entry->refs, 1);
-					nvmet_mdev_cache_entry_free(ctrl, entry);
-					if (i + 1 < count) {
-						u64 next = base +
-							((u64)(i + 1) << PAGE_SHIFT);
-
-						nvmet_mdev_unpin(ctrl, next,
-								 count - i - 1);
-					}
-					goto unlock_cached;
-				}
-				list_add(&entry->lru, &ctrl->pin_cache_lru);
-				ctrl->pin_cache_nr_pages++;
-				payload->cache_entries[payload->nr_entries++] = entry;
-				sg_set_page(sg, entry->page,
-					    segments[first + i].length,
-					    offset_in_page(segments[first + i].iova));
-				sg = sg_next(sg);
-				atomic64_inc(&ctrl->stats.pin_cache_misses);
-			}
-			first += count;
-		}
-		payload->active = true;
-		goto account_unlock;
-	}
-
 	while (first < nr_segments) {
-		unsigned int count = 1;
+		struct nvmet_mdev_pin_cache_entry *entry;
 		u64 base = round_down(segments[first].iova, PAGE_SIZE);
+		unsigned int count = 1;
 		unsigned int i;
+
+		entry = xa_load(&ctrl->pin_cache, base >> PAGE_SHIFT);
+		if (entry) {
+			refcount_inc(&entry->refs);
+			list_move(&entry->lru, &ctrl->pin_cache_lru);
+			payload->cache_entries[payload->nr_entries++] = entry;
+			sg_set_page(sg, entry->page, segments[first].length,
+				    offset_in_page(segments[first].iova));
+			sg = sg_next(sg);
+			nvmet_mdev_stat_inc(ctrl, pin_cache_hits);
+			first++;
+			continue;
+		}
 
 		while (first + count < nr_segments &&
 		       count < VFIO_PIN_PAGES_MAX_ENTRIES &&
 		       round_down(segments[first + count].iova, PAGE_SIZE) ==
-			base + ((u64)count << PAGE_SHIFT))
+			base + ((u64)count << PAGE_SHIFT) &&
+		       !xa_load(&ctrl->pin_cache, (base >> PAGE_SHIFT) + count))
 			count++;
 
-		ret = vfio_pin_pages(&ctrl->vdev, base, count, prot,
+		ret = vfio_pin_pages(&ctrl->vdev, base, count,
+				     IOMMU_READ | IOMMU_WRITE,
 				     &payload->pages[first]);
-		atomic64_inc(&ctrl->stats.pin_calls);
+		nvmet_mdev_stat_inc(ctrl, pin_calls);
 		if (ret != count) {
-			if (ret > 0) {
-				payload->runs[payload->nr_runs].iova = base;
-				payload->runs[payload->nr_runs].npages = ret;
-				payload->nr_runs++;
-				ret = -EFAULT;
-			} else if (!ret) {
-				ret = -EFAULT;
-			}
-			goto unlock_unpin;
+			bool permission_error = ret == -EPERM;
+
+			if (ret > 0)
+				nvmet_mdev_unpin(ctrl, base, ret);
+			ret = permission_error ? -EACCES :
+				(ret < 0 ? ret : -EFAULT);
+			goto unlock_cached;
 		}
 
-		payload->runs[payload->nr_runs].iova = base;
-		payload->runs[payload->nr_runs].npages = count;
-		payload->nr_runs++;
 		for (i = 0; i < count; i++) {
-			sg_set_page(sg, payload->pages[first + i],
-				    segments[first + i].length,
+			while (ctrl->pin_cache_nr_pages >=
+			       ctrl->runtime.pin_cache_pages &&
+			       nvmet_mdev_cache_evict_one(ctrl))
+				;
+
+			entry = kzalloc_obj(*entry);
+			if (!entry) {
+				nvmet_mdev_unpin(ctrl,
+						 base + ((u64)i << PAGE_SHIFT), count - i);
+				ret = -ENOMEM;
+				goto unlock_cached;
+			}
+			entry->iova = base + ((u64)i << PAGE_SHIFT);
+			entry->page = payload->pages[first + i];
+			refcount_set(&entry->refs, 2);
+			INIT_LIST_HEAD(&entry->lru);
+			ret = xa_err(xa_store(&ctrl->pin_cache,
+					      entry->iova >> PAGE_SHIFT,
+					      entry, GFP_KERNEL));
+			if (ret) {
+				refcount_set(&entry->refs, 1);
+				nvmet_mdev_cache_entry_free(ctrl, entry);
+				if (i + 1 < count) {
+					u64 next = base +
+						((u64)(i + 1) << PAGE_SHIFT);
+
+					nvmet_mdev_unpin(ctrl, next, count - i - 1);
+				}
+				goto unlock_cached;
+			}
+			list_add(&entry->lru, &ctrl->pin_cache_lru);
+			ctrl->pin_cache_nr_pages++;
+			payload->cache_entries[payload->nr_entries++] = entry;
+			sg_set_page(sg, entry->page, segments[first + i].length,
 				    offset_in_page(segments[first + i].iova));
 			sg = sg_next(sg);
+			nvmet_mdev_stat_inc(ctrl, pin_cache_misses);
 		}
 		first += count;
 	}
-
-	list_add_tail(&payload->entry, &ctrl->payloads);
 	payload->active = true;
-account_unlock:
 	{
 		u64 bytes = 0;
 
 		for (first = 0; first < nr_segments; first++)
 			bytes += segments[first].length;
-		atomic64_add(bytes, &ctrl->stats.pinned_io_bytes);
+		nvmet_mdev_stat_add(ctrl, pinned_io_bytes, bytes);
 	}
 	mutex_unlock(&ctrl->dma_lock);
+	up_read(&ctrl->dma_pin_lock);
 	return 0;
-
-unlock_unpin:
-	while (payload->nr_runs) {
-		struct nvmet_mdev_pin_run *run;
-
-		payload->nr_runs--;
-		run = &payload->runs[payload->nr_runs];
-		nvmet_mdev_unpin(ctrl, run->iova, run->npages);
-	}
-	goto unlock_release;
 unlock_cached:
 	while (payload->nr_entries)
 		refcount_dec(&payload->cache_entries[--payload->nr_entries]->refs);
@@ -510,6 +582,7 @@ unlock_release:
 	mutex_unlock(&ctrl->dma_lock);
 	payload->active = false;
 	nvmet_mdev_payload_release(ctrl, payload);
+	up_read(&ctrl->dma_pin_lock);
 	return ret;
 }
 
@@ -518,7 +591,7 @@ int nvmet_mdev_pin_payload(struct nvmet_mdev_ctrl *ctrl,
 			   unsigned int nr_segments, int prot,
 			   struct nvmet_mdev_payload *payload)
 {
-	bool cached = ctrl->runtime.pin_cache && ctrl->runtime.pin_cache_pages &&
+	bool cached = ctrl->runtime.pin_cache_pages &&
 		      nr_segments <= ctrl->runtime.pin_cache_max_segs;
 	int ret;
 
@@ -527,7 +600,7 @@ int nvmet_mdev_pin_payload(struct nvmet_mdev_ctrl *ctrl,
 	if (ret != -EACCES || !cached)
 		return ret;
 
-	atomic64_inc(&ctrl->stats.pin_cache_permission_fallbacks);
+	nvmet_mdev_stat_inc(ctrl, pin_cache_permission_fallbacks);
 	return nvmet_mdev_pin_payload_mode(ctrl, segments, nr_segments, prot,
 					   payload, false);
 }
@@ -578,6 +651,7 @@ void nvmet_mdev_dma_unmap(struct nvmet_mdev_ctrl *ctrl, u64 iova, u64 length)
 	bool active_cache = false;
 
 	mutex_lock(&ctrl->state_lock);
+	down_write(&ctrl->dma_pin_lock);
 	mutex_lock(&ctrl->dma_lock);
 	ctrl->dma_blocked = true;
 	if (length)
@@ -615,10 +689,13 @@ void nvmet_mdev_dma_unmap(struct nvmet_mdev_ctrl *ctrl, u64 iova, u64 length)
 		mutex_lock(&ctrl->dma_lock);
 		ctrl->dma_blocked = false;
 		mutex_unlock(&ctrl->dma_lock);
+		up_write(&ctrl->dma_pin_lock);
 		mutex_unlock(&ctrl->state_lock);
 		return;
 	}
 
+	/* New readers observe dma_blocked after the invalidation snapshot. */
+	up_write(&ctrl->dma_pin_lock);
 	nvmet_mdev_disable_ctrl_locked(ctrl, 0);
 	mutex_lock(&ctrl->lock);
 	list_for_each_entry_safe(mapping, tmp, &ctrl->mappings, entry) {

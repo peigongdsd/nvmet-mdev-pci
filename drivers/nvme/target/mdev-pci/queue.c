@@ -16,20 +16,7 @@
 #define NVMET_MDEV_PRP_ENTRIES		(SZ_4K / sizeof(__le64))
 #define NVMET_MDEV_MAX_SEGS		(NVMET_MDEV_COPY_MAX_DATA / SZ_4K + 1)
 #define NVMET_MDEV_BATCH_SIZE		64
-#define NVMET_MDEV_POLL_BUSY		msecs_to_jiffies(20)
 #define NVMET_MDEV_POLL_INTERVAL	msecs_to_jiffies(10)
-
-static bool pinned_io = true;
-module_param_named(pinned_io, pinned_io, bool, 0644);
-MODULE_PARM_DESC(pinned_io, "Use pinned guest pages for I/O payloads");
-
-static bool inline_data = true;
-module_param_named(inline_data, inline_data, bool, 0644);
-MODULE_PARM_DESC(inline_data, "Use inline PRP and payload metadata for common I/O sizes");
-
-static bool pin_cache = true;
-module_param_named(pin_cache, pin_cache, bool, 0644);
-MODULE_PARM_DESC(pin_cache, "Cache pinned guest payload pages between requests");
 
 static uint pin_cache_pages = 65536;
 module_param_named(pin_cache_pages, pin_cache_pages, uint, 0644);
@@ -39,54 +26,24 @@ static uint pin_cache_max_segs = 64;
 module_param_named(pin_cache_max_segs, pin_cache_max_segs, uint, 0644);
 MODULE_PARM_DESC(pin_cache_max_segs, "Maximum PRP segments admitted to the pin cache");
 
-static bool direct_submit = true;
-module_param_named(direct_submit, direct_submit, bool, 0644);
-MODULE_PARM_DESC(direct_submit, "Submit nvmet requests directly from the SQ batch worker");
-
-static bool direct_complete = true;
-module_param_named(direct_complete, direct_complete, bool, 0644);
-MODULE_PARM_DESC(direct_complete,
-		 "Complete cached payloads inline when lockless I/O is enabled");
-
-static bool lockless_io = true;
-module_param_named(lockless_io, lockless_io, bool, 0644);
-MODULE_PARM_DESC(lockless_io, "Avoid the controller mutex in live SQ/CQ processing");
-
-static bool budget_poll = true;
-module_param_named(budget_poll, budget_poll, bool, 0644);
-MODULE_PARM_DESC(budget_poll, "Use event-index-driven bounded DBBUF polling");
-
 static uint poll_budget = 128;
 module_param_named(poll_budget, poll_budget, uint, 0644);
 MODULE_PARM_DESC(poll_budget, "Maximum queues examined by one bounded DBBUF poll run");
 
-static bool fast_doorbell = true;
-module_param_named(fast_doorbell, fast_doorbell, bool, 0644);
-MODULE_PARM_DESC(fast_doorbell, "Use the allocation-free 32-bit doorbell write path");
-
-static bool msix_scan_suppress = true;
-module_param_named(msix_scan_suppress, msix_scan_suppress, bool, 0644);
-MODULE_PARM_DESC(msix_scan_suppress,
-		 "Scan pending MSI-X vectors only after mask or table writes");
-
-static bool cq_head_suppress = true;
-module_param_named(cq_head_suppress, cq_head_suppress, bool, 0644);
-MODULE_PARM_DESC(cq_head_suppress,
-		 "Only wake a CQ worker for head updates when publication is blocked");
-
 struct nvmet_mdev_iod {
 	struct list_head entry;
+	struct llist_node free_node;
 	struct nvmet_mdev_ctrl *ctrl;
 	struct nvmet_mdev_sq *sq;
 	struct nvmet_mdev_cq *cq;
-	struct work_struct submit_work;
-	struct work_struct response_work;
 	struct nvmet_req req;
 	struct nvme_command cmd;
 	struct nvme_completion cqe;
 	refcount_t refs;
 	struct nvmet_mdev_payload payload;
 	struct nvmet_mdev_iova_segment *segments;
+	struct nvmet_mdev_iova_segment *segment_storage;
+	__le64 *prp_storage;
 	struct nvmet_mdev_iova_segment inline_segments[NVMET_MDEV_INLINE_SEGS];
 	__le64 inline_prps[NVMET_MDEV_INLINE_SEGS];
 	unsigned int nr_segments;
@@ -95,21 +52,63 @@ struct nvmet_mdev_iod {
 	bool pinned;
 };
 
+static void nvmet_mdev_destroy_iod(struct nvmet_mdev_ctrl *ctrl,
+				   struct nvmet_mdev_iod *iod)
+{
+	nvmet_mdev_payload_destroy(&iod->payload);
+	kfree(iod->prp_storage);
+	kfree(iod->segment_storage);
+	mempool_free(iod, &ctrl->iod_pool);
+}
+
 static void nvmet_mdev_free_iod(struct nvmet_mdev_iod *iod)
 {
+	struct nvmet_mdev_ctrl *ctrl = iod->ctrl;
+
 	if (iod->payload.active)
-		nvmet_mdev_unpin_payload(iod->ctrl, &iod->payload);
+		nvmet_mdev_unpin_payload(ctrl, &iod->payload);
 	if (iod->req.sg && !iod->pinned)
 		nvmet_req_free_sgls(&iod->req);
-	if (iod->segments != iod->inline_segments)
-		kfree(iod->segments);
-	mempool_free(iod, &iod->ctrl->iod_pool);
+	if (atomic_inc_return(&ctrl->iod_free_count) <= ctrl->iod_free_limit) {
+		llist_add(&iod->free_node, &ctrl->iod_free);
+		return;
+	}
+	atomic_dec(&ctrl->iod_free_count);
+	nvmet_mdev_destroy_iod(ctrl, iod);
 }
 
 static void nvmet_mdev_put_iod(struct nvmet_mdev_iod *iod)
 {
 	if (refcount_dec_and_test(&iod->refs))
 		nvmet_mdev_free_iod(iod);
+}
+
+static struct nvmet_mdev_iod *nvmet_mdev_alloc_iod(struct nvmet_mdev_ctrl *ctrl)
+{
+	struct llist_node *node = llist_del_first(&ctrl->iod_free);
+	struct nvmet_mdev_payload_backing payload_backing = {};
+	struct nvmet_mdev_iova_segment *segment_storage = NULL;
+	struct nvmet_mdev_iod *iod;
+	__le64 *prp_storage = NULL;
+
+	if (node) {
+		atomic_dec(&ctrl->iod_free_count);
+		iod = llist_entry(node, struct nvmet_mdev_iod, free_node);
+		payload_backing = iod->payload.backing;
+		segment_storage = iod->segment_storage;
+		prp_storage = iod->prp_storage;
+		nvmet_mdev_stat_inc(ctrl, iod_cache_hits);
+	} else {
+		iod = mempool_alloc(&ctrl->iod_pool, GFP_KERNEL);
+		if (!iod)
+			return NULL;
+		nvmet_mdev_stat_inc(ctrl, iod_cache_misses);
+	}
+	memset(iod, 0, sizeof(*iod));
+	iod->segment_storage = segment_storage;
+	iod->prp_storage = prp_storage;
+	iod->payload.backing = payload_backing;
+	return iod;
 }
 
 static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
@@ -132,17 +131,18 @@ static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
 		goto out;
 	}
 	max_segments = DIV_ROUND_UP((prp & (SZ_4K - 1)) + remaining, SZ_4K);
-	if (iod->ctrl->runtime.inline_data &&
-	    max_segments <= NVMET_MDEV_INLINE_SEGS) {
+	if (max_segments <= NVMET_MDEV_INLINE_SEGS) {
 		iod->segments = iod->inline_segments;
 	} else {
-		if (!iod->ctrl->runtime.inline_data)
-			max_segments = NVMET_MDEV_MAX_SEGS;
-		iod->segments = kcalloc(max_segments, sizeof(*iod->segments),
-					GFP_KERNEL);
-		if (!iod->segments)
-			return -ENOMEM;
-		atomic64_inc(&iod->ctrl->stats.prp_heap_allocs);
+		if (!iod->segment_storage) {
+			iod->segment_storage =
+				kmalloc_array(NVMET_MDEV_MAX_SEGS,
+					      sizeof(*iod->segments), GFP_KERNEL);
+			if (!iod->segment_storage)
+				return -ENOMEM;
+			nvmet_mdev_stat_inc(iod->ctrl, prp_heap_allocs);
+		}
+		iod->segments = iod->segment_storage;
 	}
 
 	{
@@ -167,16 +167,18 @@ static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
 		goto out;
 	}
 
-	if (iod->ctrl->runtime.inline_data &&
-	    DIV_ROUND_UP(remaining, SZ_4K) <= NVMET_MDEV_INLINE_SEGS) {
+	if (DIV_ROUND_UP(remaining, SZ_4K) <= NVMET_MDEV_INLINE_SEGS) {
 		prps = iod->inline_prps;
 	} else {
-		prps = kmalloc(SZ_4K, GFP_KERNEL);
-		if (!prps) {
-			ret = -ENOMEM;
-			goto out;
+		if (!iod->prp_storage) {
+			iod->prp_storage = kmalloc(SZ_4K, GFP_KERNEL);
+			if (!iod->prp_storage) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			nvmet_mdev_stat_inc(iod->ctrl, prp_heap_allocs);
 		}
-		atomic64_inc(&iod->ctrl->stats.prp_heap_allocs);
+		prps = iod->prp_storage;
 	}
 	list_iova = prp;
 
@@ -224,8 +226,6 @@ static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
 	}
 
 out:
-	if (prps != iod->inline_prps)
-		kfree(prps);
 	return ret;
 }
 
@@ -296,8 +296,7 @@ static u32 nvmet_mdev_cq_head(struct nvmet_mdev_ctrl *ctrl,
 
 static void __nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq);
 
-static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq, u32 head,
-				       bool force)
+static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq, u32 head)
 {
 	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
 	unsigned long flags;
@@ -305,7 +304,7 @@ static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq, u32 head,
 
 	spin_lock_irqsave(&cq->lock, flags);
 	if (READ_ONCE(cq->live) &&
-	    (head >= cq->depth || force ||
+	    (head >= cq->depth ||
 	     (cq->blocked && head != READ_ONCE(cq->head)))) {
 		__nvmet_mdev_queue_cq_work(cq);
 		wake = true;
@@ -313,116 +312,8 @@ static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq, u32 head,
 	spin_unlock_irqrestore(&cq->lock, flags);
 
 	if (wake)
-		atomic64_inc(&ctrl->stats.cq_head_wakeups);
+		nvmet_mdev_stat_inc(ctrl, cq_head_wakeups);
 	return wake;
-}
-
-static void nvmet_mdev_legacy_poll(struct nvmet_mdev_ctrl *ctrl)
-{
-	unsigned int qid;
-	u64 runs = 0;
-	u64 queue_checks = 0;
-
-	for (;;) {
-		bool activity = false;
-		bool raced = false;
-
-		runs++;
-
-		mutex_lock(&ctrl->lock);
-		if (!ctrl->enabled || !ctrl->dbbuf_dbs || !ctrl->dbbuf_eis) {
-			mutex_unlock(&ctrl->lock);
-			atomic64_add(runs, &ctrl->stats.poll_runs);
-			atomic64_add(queue_checks, &ctrl->stats.poll_queue_checks);
-			return;
-		}
-
-		for (qid = 1; qid < ctrl->nr_queues; qid++) {
-			struct nvmet_mdev_sq *sq = &ctrl->sqs[qid];
-			struct nvmet_mdev_cq *cq = &ctrl->cqs[qid];
-			u32 value;
-
-			queue_checks++;
-			if (sq->live) {
-				value = nvmet_mdev_sq_tail(ctrl, sq);
-				if (value != READ_ONCE(sq->head)) {
-					schedule_work(&sq->work);
-					activity = true;
-				}
-			}
-			if (cq->live) {
-				value = nvmet_mdev_cq_head(ctrl, cq);
-				if (value != READ_ONCE(cq->head) &&
-				    nvmet_mdev_handle_cq_head(cq, value,
-					!ctrl->runtime.cq_head_suppress)) {
-					activity = true;
-				}
-			}
-		}
-
-		if (activity)
-			ctrl->poll_busy_until = jiffies + NVMET_MDEV_POLL_BUSY;
-		if (time_before(jiffies, ctrl->poll_busy_until)) {
-			for (qid = 1; qid < ctrl->nr_queues; qid++) {
-				u32 value;
-
-				queue_checks++;
-				if (ctrl->sqs[qid].live) {
-					value = nvmet_mdev_sq_tail(ctrl, &ctrl->sqs[qid]) - 1;
-					WRITE_ONCE(ctrl->dbbuf_eis[qid * 2],
-						   cpu_to_le32(value));
-				}
-				if (ctrl->cqs[qid].live) {
-					value = nvmet_mdev_cq_head(ctrl, &ctrl->cqs[qid]) - 1;
-					WRITE_ONCE(ctrl->dbbuf_eis[qid * 2 + 1],
-						   cpu_to_le32(value));
-				}
-			}
-			mutex_unlock(&ctrl->lock);
-			cond_resched();
-			cpu_relax();
-			continue;
-		}
-
-		for (qid = 1; qid < ctrl->nr_queues; qid++) {
-			u32 value;
-
-			queue_checks++;
-			if (ctrl->sqs[qid].live) {
-				value = nvmet_mdev_sq_tail(ctrl, &ctrl->sqs[qid]);
-				WRITE_ONCE(ctrl->dbbuf_eis[qid * 2],
-					   cpu_to_le32(value));
-			}
-			if (ctrl->cqs[qid].live) {
-				value = nvmet_mdev_cq_head(ctrl, &ctrl->cqs[qid]);
-				WRITE_ONCE(ctrl->dbbuf_eis[qid * 2 + 1],
-					   cpu_to_le32(value));
-			}
-		}
-		/* Publish event indices before checking for a racing doorbell. */
-		mb();
-		for (qid = 1; qid < ctrl->nr_queues; qid++) {
-			queue_checks++;
-			if (ctrl->sqs[qid].live &&
-			    nvmet_mdev_sq_tail(ctrl, &ctrl->sqs[qid]) !=
-			    le32_to_cpu(READ_ONCE(ctrl->dbbuf_eis[qid * 2])))
-				raced = true;
-			if (ctrl->cqs[qid].live &&
-			    nvmet_mdev_cq_head(ctrl, &ctrl->cqs[qid]) !=
-			    le32_to_cpu(READ_ONCE(ctrl->dbbuf_eis[qid * 2 + 1])))
-				raced = true;
-		}
-		if (raced)
-			ctrl->poll_busy_until = jiffies + NVMET_MDEV_POLL_BUSY;
-		mutex_unlock(&ctrl->lock);
-		if (!raced) {
-			schedule_delayed_work(&ctrl->poll_work,
-					      NVMET_MDEV_POLL_INTERVAL);
-			atomic64_add(runs, &ctrl->stats.poll_runs);
-			atomic64_add(queue_checks, &ctrl->stats.poll_queue_checks);
-			return;
-		}
-	}
 }
 
 static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
@@ -430,10 +321,8 @@ static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 	unsigned int qid, limit, scanned = 0;
 	bool enabled;
 
-	atomic64_inc(&ctrl->stats.poll_wakeups);
-	atomic64_inc(&ctrl->stats.poll_runs);
-	if (!ctrl->runtime.lockless_io)
-		mutex_lock(&ctrl->lock);
+	nvmet_mdev_stat_inc(ctrl, poll_wakeups);
+	nvmet_mdev_stat_inc(ctrl, poll_runs);
 	enabled = READ_ONCE(ctrl->enabled) && READ_ONCE(ctrl->dbbuf_dbs) &&
 		  READ_ONCE(ctrl->dbbuf_eis);
 	if (!enabled)
@@ -455,8 +344,7 @@ static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 			u32 head = nvmet_mdev_cq_head(ctrl, cq);
 
 			if (head != READ_ONCE(cq->head))
-				nvmet_mdev_handle_cq_head(cq, head,
-					!ctrl->runtime.cq_head_suppress);
+				nvmet_mdev_handle_cq_head(cq, head);
 		}
 		scanned++;
 		qid++;
@@ -465,12 +353,10 @@ static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 	}
 	ctrl->poll_next_qid = qid;
 account:
-	atomic64_add(scanned, &ctrl->stats.poll_queue_checks);
+	nvmet_mdev_stat_add(ctrl, poll_queue_checks, scanned);
 unlock:
-	if (!ctrl->runtime.lockless_io)
-		mutex_unlock(&ctrl->lock);
 	if (enabled) {
-		atomic64_inc(&ctrl->stats.poll_sleeps);
+		nvmet_mdev_stat_inc(ctrl, poll_sleeps);
 		schedule_delayed_work(&ctrl->poll_work,
 				      NVMET_MDEV_POLL_INTERVAL);
 	}
@@ -482,23 +368,14 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 		container_of(to_delayed_work(work), struct nvmet_mdev_ctrl,
 			     poll_work);
 
-	if (ctrl->runtime.budget_poll)
-		nvmet_mdev_budget_poll(ctrl);
-	else
-		nvmet_mdev_legacy_poll(ctrl);
+	nvmet_mdev_budget_poll(ctrl);
 }
 
 static void nvmet_mdev_kick_poller(struct nvmet_mdev_ctrl *ctrl)
 {
 	bool enabled;
 
-	if (!ctrl->runtime.lockless_io)
-		mutex_lock(&ctrl->lock);
 	enabled = READ_ONCE(ctrl->enabled) && READ_ONCE(ctrl->dbbuf_dbs);
-	if (enabled && !ctrl->runtime.budget_poll)
-		ctrl->poll_busy_until = jiffies + NVMET_MDEV_POLL_BUSY;
-	if (!ctrl->runtime.lockless_io)
-		mutex_unlock(&ctrl->lock);
 	if (!enabled)
 		return;
 	mod_delayed_work(system_wq, &ctrl->poll_work, 0);
@@ -550,22 +427,15 @@ static void nvmet_mdev_complete_iod(struct nvmet_mdev_iod *iod)
 	struct nvmet_mdev_ctrl *ctrl = iod->ctrl;
 	unsigned long flags;
 
-	if (!ctrl->runtime.lockless_io)
-		mutex_lock(&ctrl->lock);
-
 	spin_lock_irqsave(&cq->lock, flags);
 	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live)) {
 		spin_unlock_irqrestore(&cq->lock, flags);
-		if (!ctrl->runtime.lockless_io)
-			mutex_unlock(&ctrl->lock);
 		nvmet_mdev_put_iod(iod);
 		return;
 	}
 	list_add_tail(&iod->entry, &cq->completions);
 	__nvmet_mdev_queue_cq_work(cq);
 	spin_unlock_irqrestore(&cq->lock, flags);
-	if (!ctrl->runtime.lockless_io)
-		mutex_unlock(&ctrl->lock);
 }
 
 static void nvmet_mdev_response_iod(struct nvmet_mdev_iod *iod)
@@ -594,10 +464,34 @@ static void nvmet_mdev_response_iod(struct nvmet_mdev_iod *iod)
 
 static void nvmet_mdev_response_work(struct work_struct *work)
 {
-	struct nvmet_mdev_iod *iod =
-		container_of(work, struct nvmet_mdev_iod, response_work);
+	struct nvmet_mdev_sq *sq =
+		container_of(work, struct nvmet_mdev_sq, response_work);
+	struct nvmet_mdev_ctrl *ctrl = sq->ctrl;
+	unsigned long flags;
 
-	nvmet_mdev_response_iod(iod);
+	nvmet_mdev_stat_inc(ctrl, response_work_runs);
+	for (;;) {
+		struct nvmet_mdev_iod *iod, *tmp;
+		unsigned int nr = 0;
+		LIST_HEAD(responses);
+
+		spin_lock_irqsave(&sq->response_lock, flags);
+		if (list_empty(&sq->responses)) {
+			atomic_set(&sq->response_work_queued, 0);
+			spin_unlock_irqrestore(&sq->response_lock, flags);
+			return;
+		}
+		list_splice_init(&sq->responses, &responses);
+		spin_unlock_irqrestore(&sq->response_lock, flags);
+
+		list_for_each_entry_safe(iod, tmp, &responses, entry) {
+			list_del_init(&iod->entry);
+			nvmet_mdev_response_iod(iod);
+			nr++;
+		}
+		nvmet_mdev_stat_inc(ctrl, response_batches);
+		nvmet_mdev_stat_add(ctrl, response_items, nr);
+	}
 }
 
 static void nvmet_mdev_submit_iod(struct nvmet_mdev_iod *iod)
@@ -606,21 +500,10 @@ static void nvmet_mdev_submit_iod(struct nvmet_mdev_iod *iod)
 	u16 status;
 	int ret;
 
-	if (iod->ctrl->runtime.lockless_io) {
-		if (!READ_ONCE(iod->ctrl->enabled) || !READ_ONCE(iod->sq->live)) {
-			nvmet_mdev_put_iod(iod);
-			nvmet_mdev_put_iod(iod);
-			return;
-		}
-	} else {
-		mutex_lock(&iod->ctrl->lock);
-		if (!iod->ctrl->enabled || !iod->sq->live) {
-			mutex_unlock(&iod->ctrl->lock);
-			nvmet_mdev_put_iod(iod);
-			nvmet_mdev_put_iod(iod);
-			return;
-		}
-		mutex_unlock(&iod->ctrl->lock);
+	if (!READ_ONCE(iod->ctrl->enabled) || !READ_ONCE(iod->sq->live)) {
+		nvmet_mdev_put_iod(iod);
+		nvmet_mdev_put_iod(iod);
+		return;
 	}
 
 	if (!nvmet_req_init(req, &iod->sq->nvme_sq,
@@ -648,7 +531,7 @@ static void nvmet_mdev_submit_iod(struct nvmet_mdev_iod *iod)
 			goto complete;
 		}
 
-		if (iod->ctrl->runtime.pinned_io && iod->sq->qid) {
+		if (iod->sq->qid) {
 			ret = nvmet_mdev_pin_payload(iod->ctrl, iod->segments,
 						     iod->nr_segments,
 						     iod->host_to_ctrl ?
@@ -659,7 +542,7 @@ static void nvmet_mdev_submit_iod(struct nvmet_mdev_iod *iod)
 				goto complete;
 			}
 			req->sg = iod->payload.sgt.sgl;
-			req->sg_cnt = iod->payload.sgt.orig_nents;
+			req->sg_cnt = iod->nr_segments;
 			iod->pinned = true;
 		} else {
 			ret = nvmet_req_alloc_sgls(req);
@@ -687,14 +570,6 @@ complete:
 	nvmet_mdev_put_iod(iod);
 }
 
-static void nvmet_mdev_submit_work(struct work_struct *work)
-{
-	struct nvmet_mdev_iod *iod =
-		container_of(work, struct nvmet_mdev_iod, submit_work);
-
-	nvmet_mdev_submit_iod(iod);
-}
-
 static void nvmet_mdev_sq_work(struct work_struct *work)
 {
 	struct nvmet_mdev_sq *sq =
@@ -707,37 +582,29 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 	LIST_HEAD(submissions);
 	u32 tail;
 
-	atomic64_inc(&ctrl->stats.sq_work_runs);
-	if (!ctrl->runtime.lockless_io)
-		mutex_lock(&ctrl->lock);
+	nvmet_mdev_stat_inc(ctrl, sq_work_runs);
 	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(sq->live))
 		goto unlock;
 
 	tail = nvmet_mdev_sq_tail(ctrl, sq);
 	if (tail >= sq->depth) {
-		if (ctrl->runtime.lockless_io)
-			mutex_lock(&ctrl->lock);
+		mutex_lock(&ctrl->lock);
 		WRITE_ONCE(ctrl->enabled, false);
 		nvmet_mdev_pci_set_fatal(ctrl);
-		if (ctrl->runtime.lockless_io)
-			mutex_unlock(&ctrl->lock);
+		mutex_unlock(&ctrl->lock);
 		goto unlock;
 	}
 
 	while (sq->head != tail && processed < NVMET_MDEV_BATCH_SIZE) {
-		iod = mempool_alloc(&ctrl->iod_pool, GFP_KERNEL);
+		iod = nvmet_mdev_alloc_iod(ctrl);
 		if (!iod) {
-			if (ctrl->runtime.lockless_io)
-				mutex_lock(&ctrl->lock);
+			mutex_lock(&ctrl->lock);
 			WRITE_ONCE(ctrl->enabled, false);
 			nvmet_mdev_pci_set_fatal(ctrl);
-			if (ctrl->runtime.lockless_io)
-				mutex_unlock(&ctrl->lock);
+			mutex_unlock(&ctrl->lock);
 			failed = true;
 			break;
 		}
-		memset(iod, 0, sizeof(*iod));
-
 		iod->ctrl = ctrl;
 		iod->sq = sq;
 		iod->cq = sq->cq;
@@ -746,8 +613,6 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 		iod->req.port = ctrl->mport->port;
 		refcount_set(&iod->refs, 2);
 		INIT_LIST_HEAD(&iod->entry);
-		INIT_WORK(&iod->submit_work, nvmet_mdev_submit_work);
-		INIT_WORK(&iod->response_work, nvmet_mdev_response_work);
 		dma_rmb();
 		memcpy(&iod->cmd,
 		       sq->entries + sq->head * sizeof(struct nvme_command),
@@ -757,34 +622,24 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 		processed++;
 	}
 	more = sq->head != tail;
-	atomic64_add(processed, &ctrl->stats.commands);
+	nvmet_mdev_stat_add(ctrl, commands, processed);
 	if (processed)
-		atomic64_inc(&ctrl->stats.sq_batches);
+		nvmet_mdev_stat_inc(ctrl, sq_batches);
 
 unlock:
-	if (!ctrl->runtime.lockless_io)
-		mutex_unlock(&ctrl->lock);
 	list_for_each_entry_safe(iod, tmp, &submissions, entry) {
 		list_del_init(&iod->entry);
 		if (failed) {
 			nvmet_mdev_put_iod(iod);
 			nvmet_mdev_put_iod(iod);
-		} else if (ctrl->runtime.direct_submit) {
-			nvmet_mdev_submit_iod(iod);
-		} else if (!queue_work(sq->iod_wq, &iod->submit_work)) {
-			nvmet_mdev_put_iod(iod);
-			nvmet_mdev_put_iod(iod);
 		} else {
-			atomic64_inc(&ctrl->stats.submit_work_hops);
+			nvmet_mdev_submit_iod(iod);
 		}
 	}
 	if (more && !failed)
 		schedule_work(&sq->work);
-	else if (ctrl->runtime.budget_poll && !failed &&
-		 nvmet_mdev_arm_sq_event(ctrl, sq))
+	else if (!failed && nvmet_mdev_arm_sq_event(ctrl, sq))
 		schedule_work(&sq->work);
-	if (processed && !ctrl->runtime.budget_poll)
-		nvmet_mdev_kick_poller(ctrl);
 }
 
 static void nvmet_mdev_cq_work(struct work_struct *work)
@@ -798,25 +653,21 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 	bool blocked;
 	u32 head;
 
-	atomic64_inc(&ctrl->stats.cq_work_runs);
+	nvmet_mdev_stat_inc(ctrl, cq_work_runs);
 again:
 	completed = 0;
 	{
 		LIST_HEAD(done);
 
-		if (!ctrl->runtime.lockless_io)
-			mutex_lock(&ctrl->lock);
 		if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live))
 			goto unlock;
 
 		head = nvmet_mdev_cq_head(ctrl, cq);
 		if (head >= cq->depth) {
-			if (ctrl->runtime.lockless_io)
-				mutex_lock(&ctrl->lock);
+			mutex_lock(&ctrl->lock);
 			WRITE_ONCE(ctrl->enabled, false);
 			nvmet_mdev_pci_set_fatal(ctrl);
-			if (ctrl->runtime.lockless_io)
-				mutex_unlock(&ctrl->lock);
+			mutex_unlock(&ctrl->lock);
 			goto unlock;
 		}
 		WRITE_ONCE(cq->head, head);
@@ -846,13 +697,11 @@ again:
 		spin_unlock_irqrestore(&cq->lock, flags);
 		if (completed)
 			dma_wmb();
-		atomic64_add(completed, &ctrl->stats.completions);
+		nvmet_mdev_stat_add(ctrl, completions, completed);
 		if (completed)
-			atomic64_inc(&ctrl->stats.cq_batches);
+			nvmet_mdev_stat_inc(ctrl, cq_batches);
 
 unlock:
-		if (!ctrl->runtime.lockless_io)
-			mutex_unlock(&ctrl->lock);
 		list_for_each_entry_safe(iod, tmp, &done, entry) {
 			list_del_init(&iod->entry);
 			nvmet_mdev_put_iod(iod);
@@ -861,9 +710,6 @@ unlock:
 
 	if (completed && cq->irq_enabled)
 		nvmet_mdev_notify_irq(ctrl, cq->vector, completed, !cq->qid);
-	if (completed && !ctrl->runtime.budget_poll)
-		nvmet_mdev_kick_poller(ctrl);
-
 	spin_lock_irqsave(&cq->lock, flags);
 	blocked = READ_ONCE(ctrl->enabled) && READ_ONCE(cq->live) &&
 		  !list_empty(&cq->completions) &&
@@ -884,7 +730,7 @@ unlock:
 		 * A head write before blocked was published is caught here. A
 		 * later write observes blocked under cq->lock and queues the worker.
 		 */
-		if (ctrl->runtime.budget_poll && READ_ONCE(ctrl->dbbuf_dbs)) {
+		if (READ_ONCE(ctrl->dbbuf_dbs)) {
 			advanced = nvmet_mdev_arm_cq_event(ctrl, cq);
 		} else {
 			/* Publish blocked before checking for a racing head update. */
@@ -894,7 +740,7 @@ unlock:
 		}
 		if (advanced)
 			nvmet_mdev_handle_cq_head(cq,
-				nvmet_mdev_cq_head(ctrl, cq), false);
+				nvmet_mdev_cq_head(ctrl, cq));
 	}
 }
 
@@ -902,17 +748,20 @@ void nvmet_mdev_queue_response(struct nvmet_req *req)
 {
 	struct nvmet_mdev_iod *iod =
 		container_of(req, struct nvmet_mdev_iod, req);
+	struct nvmet_mdev_sq *sq = iod->sq;
+	unsigned long flags;
+	bool queue;
 
-	if (iod->ctrl->runtime.direct_complete &&
-	    iod->ctrl->runtime.lockless_io && iod->pinned &&
-	    iod->payload.cached) {
+	if (iod->pinned && iod->payload.cached) {
 		nvmet_mdev_response_iod(iod);
 		return;
 	}
-	if (!queue_work(iod->sq->iod_wq, &iod->response_work))
-		nvmet_mdev_put_iod(iod);
-	else
-		atomic64_inc(&iod->ctrl->stats.response_work_hops);
+	spin_lock_irqsave(&sq->response_lock, flags);
+	list_add_tail(&iod->entry, &sq->responses);
+	queue = atomic_cmpxchg(&sq->response_work_queued, 0, 1) == 0;
+	spin_unlock_irqrestore(&sq->response_lock, flags);
+	if (queue)
+		WARN_ON_ONCE(!queue_work(sq->iod_wq, &sq->response_work));
 }
 
 static void nvmet_mdev_drain_completions(struct nvmet_mdev_cq *cq)
@@ -935,16 +784,6 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 {
 	unsigned int qid;
 
-	ctrl->runtime.pinned_io = READ_ONCE(pinned_io);
-	ctrl->runtime.inline_data = READ_ONCE(inline_data);
-	ctrl->runtime.pin_cache = READ_ONCE(pin_cache);
-	ctrl->runtime.direct_submit = READ_ONCE(direct_submit);
-	ctrl->runtime.direct_complete = READ_ONCE(direct_complete);
-	ctrl->runtime.lockless_io = READ_ONCE(lockless_io);
-	ctrl->runtime.budget_poll = READ_ONCE(budget_poll);
-	ctrl->runtime.fast_doorbell = READ_ONCE(fast_doorbell);
-	ctrl->runtime.msix_scan_suppress = READ_ONCE(msix_scan_suppress);
-	ctrl->runtime.cq_head_suppress = READ_ONCE(cq_head_suppress);
 	ctrl->runtime.pin_cache_pages = READ_ONCE(pin_cache_pages);
 	ctrl->runtime.pin_cache_max_segs = READ_ONCE(pin_cache_max_segs);
 	ctrl->runtime.poll_budget = max_t(unsigned int, READ_ONCE(poll_budget), 1);
@@ -952,9 +791,11 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);
 	ctrl->poll_next_qid = 1;
 	ctrl->nr_queues = ctrl->tctrl->subsys->max_qid + 1;
+	init_llist_head(&ctrl->iod_free);
+	atomic_set(&ctrl->iod_free_count, 0);
+	ctrl->iod_free_limit = min_t(unsigned int, ctrl->nr_queues * 32, 1024);
 	if (mempool_init_kmalloc_pool(&ctrl->iod_pool,
-				      min_t(unsigned int, ctrl->nr_queues * 32,
-					    1024),
+				      ctrl->iod_free_limit,
 				      sizeof(struct nvmet_mdev_iod)))
 		return -ENOMEM;
 	ctrl->iod_pool_ready = true;
@@ -980,6 +821,10 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		sq->ctrl = ctrl;
 		sq->qid = qid;
 		INIT_WORK(&sq->work, nvmet_mdev_sq_work);
+		INIT_WORK(&sq->response_work, nvmet_mdev_response_work);
+		spin_lock_init(&sq->response_lock);
+		INIT_LIST_HEAD(&sq->responses);
+		atomic_set(&sq->response_work_queued, 0);
 		cq->ctrl = ctrl;
 		cq->qid = qid;
 		spin_lock_init(&cq->lock);
@@ -1335,6 +1180,8 @@ void nvmet_mdev_disable_ctrl_locked(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 
 void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 {
+	struct llist_node *node;
+
 	nvmet_mdev_disable_ctrl(ctrl, 0);
 	cancel_delayed_work_sync(&ctrl->poll_work);
 	kfree(ctrl->cqs);
@@ -1342,6 +1189,13 @@ void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 	kfree(ctrl->sqs);
 	ctrl->sqs = NULL;
 	if (ctrl->iod_pool_ready) {
+		while ((node = llist_del_first(&ctrl->iod_free))) {
+			struct nvmet_mdev_iod *iod =
+				llist_entry(node, struct nvmet_mdev_iod, free_node);
+
+			nvmet_mdev_destroy_iod(ctrl, iod);
+		}
+		atomic_set(&ctrl->iod_free_count, 0);
 		mempool_exit(&ctrl->iod_pool);
 		ctrl->iod_pool_ready = false;
 	}
@@ -1351,23 +1205,18 @@ void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 				  bool cq)
 {
-	atomic64_inc(&ctrl->stats.doorbell_kicks);
-	if (!ctrl->runtime.lockless_io)
-		mutex_lock(&ctrl->lock);
+	nvmet_mdev_stat_inc(ctrl, doorbell_kicks);
 	if (!READ_ONCE(ctrl->enabled) || qid >= ctrl->nr_queues)
-		goto out_unlock;
+		goto out;
 	if (cq) {
 		struct nvmet_mdev_cq *mcq = &ctrl->cqs[qid];
 		u32 head = nvmet_mdev_cq_head(ctrl, mcq);
 
-		nvmet_mdev_handle_cq_head(mcq, head,
-					  !ctrl->runtime.cq_head_suppress);
+		nvmet_mdev_handle_cq_head(mcq, head);
 	} else if (READ_ONCE(ctrl->sqs[qid].live)) {
 		schedule_work(&ctrl->sqs[qid].work);
 	}
-out_unlock:
-	if (!ctrl->runtime.lockless_io)
-		mutex_unlock(&ctrl->lock);
+out:
 	nvmet_mdev_kick_poller(ctrl);
 }
 
@@ -1553,7 +1402,6 @@ u16 nvmet_mdev_set_dbbuf(struct nvmet_ctrl *tctrl, u64 dbs, u64 eis)
 
 	ctrl->dbbuf_dbs = nvmet_mdev_mapping_addr(ctrl->dbbuf_dbs_mapping);
 	ctrl->dbbuf_eis = nvmet_mdev_mapping_addr(ctrl->dbbuf_eis_mapping);
-	ctrl->poll_busy_until = jiffies + NVMET_MDEV_POLL_BUSY;
 	mutex_unlock(&ctrl->lock);
 	mod_delayed_work(system_wq, &ctrl->poll_work, 0);
 	return NVME_SC_SUCCESS;

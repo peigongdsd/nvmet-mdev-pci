@@ -112,10 +112,14 @@ void nvmet_mdev_pci_set_fatal(struct nvmet_mdev_ctrl *ctrl)
 
 void nvmet_mdev_pci_reset(struct nvmet_mdev_ctrl *ctrl)
 {
+	unsigned long flags;
+
 	lockdep_assert_held(&ctrl->lock);
 	nvmet_mdev_unmap_all(ctrl);
+	spin_lock_irqsave(&ctrl->irq_state_lock, flags);
 	nvmet_mdev_init_config(ctrl);
 	nvmet_mdev_init_bar0(ctrl);
+	spin_unlock_irqrestore(&ctrl->irq_state_lock, flags);
 	if (ctrl->tctrl)
 		nvmet_mdev_pci_bind_ctrl(ctrl);
 }
@@ -228,7 +232,7 @@ static ssize_t nvmet_mdev_fast_doorbell_write(struct nvmet_mdev_ctrl *ctrl,
 	mutex_unlock(&ctrl->lock);
 
 	*ppos += sizeof(value);
-	atomic64_inc(&ctrl->stats.fast_doorbell_writes);
+	nvmet_mdev_stat_inc(ctrl, fast_doorbell_writes);
 	nvmet_mdev_schedule_doorbell(ctrl, db / 2, db & 1);
 	return sizeof(value);
 }
@@ -261,8 +265,12 @@ static int nvmet_mdev_region(struct nvmet_mdev_ctrl *ctrl, loff_t pos,
 ssize_t nvmet_mdev_pci_read(struct nvmet_mdev_ctrl *ctrl, char __user *buf,
 			    size_t count, loff_t *ppos)
 {
+	unsigned long flags;
 	unsigned int offset;
 	size_t region_size;
+	u8 *snapshot = NULL;
+	bool pba_overlap;
+	u8 *source;
 	u8 *region;
 	int ret;
 
@@ -272,7 +280,23 @@ ssize_t nvmet_mdev_pci_read(struct nvmet_mdev_ctrl *ctrl, char __user *buf,
 		goto out_unlock;
 
 	count = min(count, region_size - offset);
-	if (copy_to_user(buf, region + offset, count)) {
+	source = region + offset;
+	pba_overlap = nvmet_mdev_write_overlaps(offset, count,
+						NVMET_MDEV_PCI_MSIX_PBA,
+						NVMET_MDEV_PCI_MSIX_VECTORS /
+						BITS_PER_BYTE);
+	if (ret == VFIO_PCI_BAR0_REGION_INDEX && pba_overlap) {
+		snapshot = kmalloc(count, GFP_KERNEL);
+		if (!snapshot) {
+			ret = -ENOMEM;
+			goto out_unlock;
+		}
+		spin_lock_irqsave(&ctrl->irq_state_lock, flags);
+		memcpy(snapshot, source, count);
+		spin_unlock_irqrestore(&ctrl->irq_state_lock, flags);
+		source = snapshot;
+	}
+	if (copy_to_user(buf, source, count)) {
 		ret = -EFAULT;
 		goto out_unlock;
 	}
@@ -281,6 +305,7 @@ ssize_t nvmet_mdev_pci_read(struct nvmet_mdev_ctrl *ctrl, char __user *buf,
 
 out_unlock:
 	mutex_unlock(&ctrl->lock);
+	kfree(snapshot);
 	return ret;
 }
 
@@ -299,8 +324,7 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 	bool update_irqs = false;
 	int index, ret;
 
-	if (ctrl->runtime.fast_doorbell &&
-	    nvmet_mdev_is_32bit_doorbell(*ppos, count, &offset))
+	if (nvmet_mdev_is_32bit_doorbell(*ppos, count, &offset))
 		return nvmet_mdev_fast_doorbell_write(ctrl, buf, ppos, offset);
 
 	mutex_lock(&ctrl->lock);
@@ -318,15 +342,26 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 	}
 
 	if (index == VFIO_PCI_CONFIG_REGION_INDEX) {
+		update_irqs = nvmet_mdev_write_overlaps(offset, count,
+							NVMET_MDEV_PCI_MSIX_CAP +
+							PCI_MSIX_FLAGS, sizeof(u16));
+		if (update_irqs)
+			spin_lock(&ctrl->irq_state_lock);
 		nvmet_mdev_config_write(ctrl, offset, data, count);
-		update_irqs = !ctrl->runtime.msix_scan_suppress ||
-			nvmet_mdev_write_overlaps(offset, count,
-				NVMET_MDEV_PCI_MSIX_CAP + PCI_MSIX_FLAGS,
-				sizeof(u16));
+		if (update_irqs)
+			spin_unlock(&ctrl->irq_state_lock);
 	} else {
 		bar0 = true;
 		old_cc = get_unaligned_le32(ctrl->bar0 + NVME_REG_CC);
+		update_irqs = nvmet_mdev_write_overlaps(offset, count,
+							NVMET_MDEV_PCI_MSIX_TABLE,
+							NVMET_MDEV_PCI_MSIX_VECTORS *
+							PCI_MSIX_ENTRY_SIZE);
+		if (update_irqs)
+			spin_lock(&ctrl->irq_state_lock);
 		nvmet_mdev_bar0_write(ctrl, offset, data, count);
+		if (update_irqs)
+			spin_unlock(&ctrl->irq_state_lock);
 		new_cc = get_unaligned_le32(ctrl->bar0 + NVME_REG_CC);
 		if (nvmet_mdev_write_overlaps(offset, count, NVME_REG_DBS, doorbell_bytes)) {
 			unsigned int start = max_t(unsigned int, offset, NVME_REG_DBS);
@@ -337,10 +372,6 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 			last_db = (end - 1 - NVME_REG_DBS) / sizeof(u32);
 			doorbells = true;
 		}
-		update_irqs = !ctrl->runtime.msix_scan_suppress ||
-			nvmet_mdev_write_overlaps(offset, count,
-				NVMET_MDEV_PCI_MSIX_TABLE,
-				NVMET_MDEV_PCI_MSIX_VECTORS * PCI_MSIX_ENTRY_SIZE);
 	}
 
 	kfree(data);

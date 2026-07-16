@@ -154,43 +154,23 @@ host-side perf collection.
 
 ## Performance controls and diagnostics
 
-The optimized pinned path is enabled by default. Runtime controls are writable
-module parameters, but their values are snapshotted per controller. Stop QEMU,
-remove the mdev, set parameters, and create a new mdev for every A/B variant.
-Changing a parameter while a controller exists does not alter that controller.
-
-To compare against the Layer 1 copy path:
-
-```sh
-echo 0 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pinned_io
-```
-
-Restore the pinned path with `echo 1`. The performance switches are:
+I/O queues always use the optimized pinned path. Implementation-choice A/B
+switches have been removed; the remaining module parameters control genuine
+capacity or polling policy. Values are snapshotted when an mdev controller is
+created, so stop QEMU, remove the mdev, change a parameter, and recreate the
+mdev before testing a new value.
 
 | Parameter | Default | Effect |
 | --- | ---: | --- |
-| `pinned_io` | 1 | Give nvmet an SG table over guest pages instead of copying payload data. |
-| `inline_data` | 1 | Embed metadata for requests of at most 32 PRP segments. |
-| `pin_cache` | 1 | Reuse VFIO payload-page pins across requests. |
 | `pin_cache_pages` | 65536 | Bound cached pins per controller; 65536 pages is 256 MiB with 4 KiB pages. |
 | `pin_cache_max_segs` | 64 | Admit requests with at most 64 PRP segments, covering common 128 KiB I/O. |
-| `direct_submit` | 1 | Submit a consumed SQ batch without a per-command workqueue hop. |
-| `direct_complete` | 1 | Avoid response work for cached pinned payloads when lockless I/O is active. |
-| `lockless_io` | 1 | Keep the controller mutex out of live SQ/CQ processing. |
-| `budget_poll` | 1 | Use event indices plus one bounded safety scan per idle interval. |
 | `poll_budget` | 128 | Maximum queue pairs examined by one safety scan. |
-| `fast_doorbell` | 1 | Handle exact 32-bit doorbell writes without allocating a temporary buffer. |
-| `msix_scan_suppress` | 1 | Scan pending MSI-X vectors only when writes can change MSI-X mask or table state. |
-| `cq_head_suppress` | 1 | Wake a CQ worker for head progress only when pending completions are blocked by a full CQ. |
 
-`direct_complete` depends on `pinned_io=1`, `pin_cache=1`, and `lockless_io=1`;
-otherwise completions use response work so a softirq cannot enter the
-mutex-based controller path. `pin_cache` has no effect on the copy path. Cold
-consecutive cache misses are pinned in batches.
+Cold consecutive cache misses are pinned in batches. Setting either cache
+limit to zero disables caching while retaining request-lifetime pinned I/O.
 The default admission limit covers repeated 4 KiB random I/O and common
 128 KiB sequential requests. Lower `pin_cache_max_segs` deliberately when
-measuring the memory cost of large-I/O cache reuse. Setting either cache limit
-to zero disables caching.
+measuring the memory cost of large-I/O cache reuse.
 
 Verify the snapshot and counters on the newly created device:
 
@@ -200,9 +180,10 @@ cat "$MDEV/transport_stats"
 ```
 
 The counters include heap allocations, pin/unpin calls, cache hits/misses and
-evictions, submission/response workqueue hops, SQ/CQ batches, interrupts,
-doorbell kicks, useful CQ-head wakeups, fast doorbell writes, and poll scans.
-They are cumulative for the mdev lifetime.
+evictions, IOD recycle hits/misses, response worker runs/batches/items, SQ/CQ
+batches, interrupts, doorbell kicks, useful CQ-head wakeups, fast doorbell
+writes, and poll scans. They are cumulative for the mdev lifetime and use
+per-CPU updates on the hot path.
 
 Useful host checks are:
 
