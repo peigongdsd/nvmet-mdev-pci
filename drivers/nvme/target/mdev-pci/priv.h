@@ -9,11 +9,13 @@
 #include <linux/mdev.h>
 #include <linux/mempool.h>
 #include <linux/mutex.h>
+#include <linux/refcount.h>
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/vfio.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 
 #include "../nvmet.h"
 
@@ -23,6 +25,7 @@
 #define NVMET_MDEV_PCI_MSIX_CAP		0x40
 #define NVMET_MDEV_PCI_MSIX_TABLE	0x2000
 #define NVMET_MDEV_PCI_MSIX_PBA		0x3000
+#define NVMET_MDEV_INLINE_SEGS		32
 
 #define NVMET_MDEV_VFIO_OFFSET_SHIFT	40
 #define NVMET_MDEV_VFIO_OFFSET_MASK	\
@@ -61,21 +64,67 @@ struct nvmet_mdev_pin_run {
 	unsigned int npages;
 };
 
+struct nvmet_mdev_pin_cache_entry {
+	struct list_head lru;
+	struct page *page;
+	refcount_t refs;
+	u64 iova;
+};
+
 struct nvmet_mdev_payload {
 	struct list_head entry;
 	struct sg_table sgt;
 	struct nvmet_mdev_pin_run *runs;
+	struct page **pages;
+	struct nvmet_mdev_pin_cache_entry **cache_entries;
+	struct scatterlist inline_sg[NVMET_MDEV_INLINE_SEGS];
+	struct nvmet_mdev_pin_run inline_runs[NVMET_MDEV_INLINE_SEGS];
+	struct page *inline_pages[NVMET_MDEV_INLINE_SEGS];
+	struct nvmet_mdev_pin_cache_entry *inline_cache_entries[NVMET_MDEV_INLINE_SEGS];
 	unsigned int nr_runs;
+	unsigned int nr_entries;
 	bool active;
+	bool cached;
+};
+
+struct nvmet_mdev_runtime_config {
+	bool pinned_io;
+	bool inline_data;
+	bool pin_cache;
+	bool direct_submit;
+	bool direct_complete;
+	bool lockless_io;
+	bool budget_poll;
+	unsigned int pin_cache_pages;
+	unsigned int pin_cache_max_segs;
+	unsigned int poll_budget;
 };
 
 struct nvmet_mdev_stats {
 	atomic64_t commands;
-	atomic64_t bytes_pinned;
+	atomic64_t pinned_io_bytes;
 	atomic64_t completions;
 	atomic64_t interrupts;
 	atomic64_t doorbell_kicks;
-	atomic64_t poll_scans;
+	atomic64_t poll_runs;
+	atomic64_t poll_queue_checks;
+	atomic64_t prp_heap_allocs;
+	atomic64_t payload_sg_heap_allocs;
+	atomic64_t pin_calls;
+	atomic64_t unpin_calls;
+	atomic64_t pin_cache_hits;
+	atomic64_t pin_cache_misses;
+	atomic64_t pin_cache_evictions;
+	atomic64_t pin_cache_permission_fallbacks;
+	atomic64_t payload_dma_lock_contentions;
+	atomic64_t submit_work_hops;
+	atomic64_t response_work_hops;
+	atomic64_t sq_work_runs;
+	atomic64_t cq_work_runs;
+	atomic64_t sq_batches;
+	atomic64_t cq_batches;
+	atomic64_t poll_wakeups;
+	atomic64_t poll_sleeps;
 };
 
 struct nvmet_mdev_ctrl;
@@ -115,6 +164,7 @@ struct nvmet_mdev_cq {
 	/* Protects completions waiting for a free CQ entry. */
 	spinlock_t lock;
 	struct list_head completions;
+	atomic_t work_queued;
 	u8 *entries;
 	u16 qid;
 	u16 depth;
@@ -130,10 +180,13 @@ struct nvmet_mdev_ctrl {
 	struct vfio_device vdev;
 	struct mdev_device *mdev;
 	struct nvmet_mdev_port *mport;
+	/* Lock order for nested acquisition: state_lock -> lock -> dma_lock. */
 	/* Serializes controller enable, disable and queue teardown. */
 	struct mutex state_lock;
 	/* Protects PCI config, BAR0 and interrupt eventfd state. */
 	struct mutex lock;
+	/* Protects payload pins, the pin cache and DMA invalidation state. */
+	struct mutex dma_lock;
 	u8 *config;
 	u8 *bar0;
 	struct eventfd_ctx *irq_ctx[NVMET_MDEV_PCI_MSIX_VECTORS];
@@ -143,6 +196,9 @@ struct nvmet_mdev_ctrl {
 	struct nvmet_ctrl *tctrl;
 	struct list_head mappings;
 	struct list_head payloads;
+	struct xarray pin_cache;
+	struct list_head pin_cache_lru;
+	unsigned int pin_cache_nr_pages;
 	struct nvmet_mdev_sq *sqs;
 	struct nvmet_mdev_cq *cqs;
 	struct nvmet_mdev_mapping *dbbuf_dbs_mapping;
@@ -151,7 +207,9 @@ struct nvmet_mdev_ctrl {
 	__le32 *dbbuf_eis;
 	struct delayed_work poll_work;
 	unsigned long poll_busy_until;
+	unsigned int poll_next_qid;
 	struct nvmet_mdev_stats stats;
+	struct nvmet_mdev_runtime_config runtime;
 	mempool_t iod_pool;
 	u16 nr_queues;
 	bool iod_pool_ready;
@@ -202,6 +260,9 @@ int nvmet_mdev_pin_payload(struct nvmet_mdev_ctrl *ctrl,
 			   struct nvmet_mdev_payload *payload);
 void nvmet_mdev_unpin_payload(struct nvmet_mdev_ctrl *ctrl,
 			      struct nvmet_mdev_payload *payload);
+void nvmet_mdev_iova_init(struct nvmet_mdev_ctrl *ctrl);
+void nvmet_mdev_iova_reset(struct nvmet_mdev_ctrl *ctrl);
+void nvmet_mdev_iova_cleanup(struct nvmet_mdev_ctrl *ctrl);
 
 int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl);

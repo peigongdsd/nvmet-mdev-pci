@@ -2,12 +2,18 @@
 
 ## Implementation status
 
-The performance batch implements the data-path portions of all four series:
-PRP collection, request-lifetime VFIO pins, transport-owned SG tables, DMA
-invalidation drains, explicit IOD references, parallel I/O workers, SQ/CQ
-batching, a mempool, real interrupt coalescing, generic nvmet Doorbell Buffer
-Config support, pinned shadow/event arrays and adaptive polling. The original
-copy path remains available through the `pinned_io` module parameter.
+The performance work now has two batches. The first implemented PRP collection,
+request-lifetime VFIO pins, transport-owned SG tables, DMA invalidation drains,
+explicit IOD references, parallel I/O workers, SQ/CQ batching, a mempool, real
+interrupt coalescing, generic nvmet Doorbell Buffer Config support, pinned
+shadow/event arrays, and adaptive polling.
+
+The second batch targets the CPU cost observed in the first VM benchmark. It
+adds inline request metadata, a bounded reusable pin cache with batched cold
+misses, direct SQ submission, direct cached-payload completion, narrower
+controller locking, CQ scheduling coalescing, and event-index-driven bounded
+polling. Every optimization has a module-parameter switch, snapshotted per mdev
+controller, so one kernel build can run the complete A/B matrix.
 
 Measurement uses per-mdev `transport_stats` counters rather than debugfs and
 tracepoints in the first batch. This avoids unconditional per-page atomics and
@@ -15,6 +21,49 @@ keeps the instrumentation usable from the benchmark scripts. Full PRP-list and
 event-index behavior has focused KUnit coverage. The remaining acceptance gate
 is a rebuilt-kernel VM run followed by the fio/host-perf matrix; compile success
 alone does not establish runtime correctness or a performance gain.
+
+The pre-optimization reference run reached about 1.1-1.16 GiB/s for 128 KiB
+sequential I/O and 31.7k IOPS for a 4 KiB 70/30 random mix at aggregate QD128.
+The random phase consumed about 46.7 percent system CPU across 20 host CPUs,
+roughly nine cores or 284 host CPU microseconds per I/O. Only 8,967 trapped
+doorbells and 483,916 interrupts served about 9.97 million commands, while the
+poller performed about 940 million queue scans. Those numbers make page-pin
+calls, workqueue transitions, allocation, controller-lock traffic, and polling
+the primary hypotheses for this batch.
+
+## Runtime experiment matrix
+
+All controls default on. Change them only after stopping QEMU and removing the
+mdev, then recreate the mdev and confirm `$MDEV/runtime_config`.
+
+| Switch | Isolated hypothesis | Expected evidence |
+| --- | --- | --- |
+| `inline_data` | Small PRP/SG allocations consume CPU. | `prp_heap_allocs` and `payload_sg_heap_allocs` approach zero for 4 KiB and aligned 128 KiB I/O. |
+| `pin_cache` | Repeated VFIO pin/unpin dominates random I/O. | Warm-cache `pin_cache_hits` rise while `pin_calls` and `unpin_calls` per command fall. |
+| `direct_submit` | Per-command submission work adds scheduling cost. | `submit_work_hops` becomes zero and context switches fall. |
+| `direct_complete` | Response work adds another scheduling hop. | With cached pins, `response_work_hops` becomes zero. |
+| `lockless_io` | `ctrl->lock` serializes hot SQ/CQ paths. | Four-job scaling and task-clock per I/O improve without correctness changes. |
+| `budget_poll` | Adaptive busy polling wastes host cores. | `poll_queue_checks` per command falls without a QD1 latency regression. |
+
+Measure a copy baseline, a request-lifetime pinned baseline, each switch added
+individually in the order above, and the all-on profile. For `pin_cache`, report
+both a cold run and an identical warm run, cache hit rate, and the random
+working-set size. A 64 MiB default cache is deliberately bounded and is not
+expected to help a uniform-random workload spanning several GiB after only one
+pass; increase `pin_cache_pages` as a separate capacity experiment. The default
+`pin_cache_max_segs=1` admits 4 KiB requests and bypasses larger sequential I/O;
+raise it separately when measuring cache reuse for larger requests.
+
+`poll_runs` counts poll function iterations and `poll_queue_checks` counts
+queue-pair loop iterations, including event publication and race checks. Both
+polling modes use those definitions, so their
+deltas can be compared directly. `pinned_io_bytes` is the amount of command
+payload handled by the pinned path, including cache hits; actual pinning cost
+is represented by `pin_calls`, `unpin_calls`, and the cache counters.
+The payload pin/cache metadata remains protected by one controller-wide mutex.
+Use `payload_dma_lock_contentions` to decide whether cache sharding or a
+two-phase pin insertion scheme is justified; the current batch does not claim
+that the pinned path is lock-free.
 
 ## Goals and constraints
 

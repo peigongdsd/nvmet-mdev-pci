@@ -154,17 +154,50 @@ host-side perf collection.
 
 ## Performance controls and diagnostics
 
-Request-lifetime page pinning is enabled by default. To compare against the
-copy path, set the parameter before creating the mdev controller:
+The optimized pinned path is enabled by default. Runtime controls are writable
+module parameters, but their values are snapshotted per controller. Stop QEMU,
+remove the mdev, set parameters, and create a new mdev for every A/B variant.
+Changing a parameter while a controller exists does not alter that controller.
+
+To compare against the Layer 1 copy path:
 
 ```sh
 echo 0 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pinned_io
 ```
 
-Restore the zero-copy path with `echo 1`. Do not change the parameter during a
-benchmark run. `transport_stats` reports commands, bytes pinned, completions,
-actual eventfd interrupts, trapped doorbell kicks, and shadow-doorbell poll
-scans.
+Restore the pinned path with `echo 1`. The performance switches are:
+
+| Parameter | Default | Effect |
+| --- | ---: | --- |
+| `pinned_io` | 1 | Give nvmet an SG table over guest pages instead of copying payload data. |
+| `inline_data` | 1 | Embed metadata for requests of at most 32 PRP segments. |
+| `pin_cache` | 1 | Reuse VFIO payload-page pins across requests. |
+| `pin_cache_pages` | 16384 | Bound cached pins per controller; 16384 pages is 64 MiB with 4 KiB pages. |
+| `pin_cache_max_segs` | 1 | Admit only requests at or below this PRP-segment count to the cache. |
+| `direct_submit` | 1 | Submit a consumed SQ batch without a per-command workqueue hop. |
+| `direct_complete` | 1 | Avoid response work for cached pinned payloads. |
+| `lockless_io` | 1 | Keep the controller mutex out of live SQ/CQ processing. |
+| `budget_poll` | 1 | Use event indices plus one bounded safety scan per idle interval. |
+| `poll_budget` | 128 | Maximum queue pairs examined by one safety scan. |
+
+`direct_complete` depends on `pinned_io=1` and `pin_cache=1`; `pin_cache` has no
+effect on the copy path. Cold consecutive cache misses are pinned in batches.
+The default admission limit targets repeated 4 KiB random I/O and lets larger
+sequential requests use batched request-lifetime pins, avoiding cache pollution
+and per-page cache entries for a cold stream. Raise `pin_cache_max_segs`
+deliberately when testing reuse of larger I/O. Setting either cache limit to
+zero disables caching.
+
+Verify the snapshot and counters on the newly created device:
+
+```sh
+cat "$MDEV/runtime_config"
+cat "$MDEV/transport_stats"
+```
+
+The counters include heap allocations, pin/unpin calls, cache hits/misses and
+evictions, submission/response workqueue hops, SQ/CQ batches, interrupts,
+doorbell kicks, and poll scans. They are cumulative for the mdev lifetime.
 
 Useful host checks are:
 
