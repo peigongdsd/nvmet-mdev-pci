@@ -45,7 +45,8 @@ MODULE_PARM_DESC(direct_submit, "Submit nvmet requests directly from the SQ batc
 
 static bool direct_complete = true;
 module_param_named(direct_complete, direct_complete, bool, 0644);
-MODULE_PARM_DESC(direct_complete, "Queue cached-payload completions without response work");
+MODULE_PARM_DESC(direct_complete,
+		 "Complete cached payloads inline when lockless I/O is enabled");
 
 static bool lockless_io = true;
 module_param_named(lockless_io, lockless_io, bool, 0644);
@@ -503,6 +504,7 @@ static void nvmet_mdev_complete_iod(struct nvmet_mdev_iod *iod)
 {
 	struct nvmet_mdev_cq *cq = iod->cq;
 	struct nvmet_mdev_ctrl *ctrl = iod->ctrl;
+	unsigned long flags;
 
 	if (ctrl->runtime.lockless_io) {
 		if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live)) {
@@ -518,9 +520,9 @@ static void nvmet_mdev_complete_iod(struct nvmet_mdev_iod *iod)
 		}
 	}
 
-	spin_lock(&cq->lock);
+	spin_lock_irqsave(&cq->lock, flags);
 	list_add_tail(&iod->entry, &cq->completions);
-	spin_unlock(&cq->lock);
+	spin_unlock_irqrestore(&cq->lock, flags);
 	nvmet_mdev_queue_cq_work(cq);
 	if (!ctrl->runtime.lockless_io)
 		mutex_unlock(&ctrl->lock);
@@ -752,6 +754,7 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
 	unsigned int completed;
 	struct nvmet_mdev_iod *iod, *tmp;
+	unsigned long flags;
 	bool blocked;
 	u32 head;
 
@@ -778,7 +781,7 @@ again:
 		}
 		cq->head = head;
 
-		spin_lock(&cq->lock);
+		spin_lock_irqsave(&cq->lock, flags);
 		while (!list_empty(&cq->completions) &&
 		       !nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
 			struct nvme_completion cqe;
@@ -800,7 +803,7 @@ again:
 			list_add_tail(&iod->entry, &done);
 			completed++;
 		}
-		spin_unlock(&cq->lock);
+		spin_unlock_irqrestore(&cq->lock, flags);
 		if (completed)
 			dma_wmb();
 		atomic64_add(completed, &ctrl->stats.completions);
@@ -821,17 +824,17 @@ unlock:
 	if (completed && !ctrl->runtime.budget_poll)
 		nvmet_mdev_kick_poller(ctrl);
 
-	spin_lock(&cq->lock);
+	spin_lock_irqsave(&cq->lock, flags);
 	blocked = !list_empty(&cq->completions) &&
 		  nvmet_pci_cq_full(cq->head, cq->tail, cq->depth);
 	if (READ_ONCE(ctrl->enabled) && READ_ONCE(cq->live) &&
 	    !list_empty(&cq->completions) &&
 	    !nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
-		spin_unlock(&cq->lock);
+		spin_unlock_irqrestore(&cq->lock, flags);
 		goto again;
 	}
 	atomic_set(&cq->work_queued, 0);
-	spin_unlock(&cq->lock);
+	spin_unlock_irqrestore(&cq->lock, flags);
 	if (ctrl->runtime.budget_poll && blocked && READ_ONCE(ctrl->enabled) &&
 	    READ_ONCE(cq->live) &&
 	    nvmet_mdev_arm_cq_event(ctrl, cq))
@@ -843,7 +846,8 @@ void nvmet_mdev_queue_response(struct nvmet_req *req)
 	struct nvmet_mdev_iod *iod =
 		container_of(req, struct nvmet_mdev_iod, req);
 
-	if (iod->ctrl->runtime.direct_complete && iod->pinned &&
+	if (iod->ctrl->runtime.direct_complete &&
+	    iod->ctrl->runtime.lockless_io && iod->pinned &&
 	    iod->payload.cached) {
 		nvmet_mdev_response_iod(iod);
 		return;
@@ -857,11 +861,12 @@ void nvmet_mdev_queue_response(struct nvmet_req *req)
 static void nvmet_mdev_drain_completions(struct nvmet_mdev_cq *cq)
 {
 	struct nvmet_mdev_iod *iod, *tmp;
+	unsigned long flags;
 	LIST_HEAD(completions);
 
-	spin_lock(&cq->lock);
+	spin_lock_irqsave(&cq->lock, flags);
 	list_splice_init(&cq->completions, &completions);
-	spin_unlock(&cq->lock);
+	spin_unlock_irqrestore(&cq->lock, flags);
 
 	list_for_each_entry_safe(iod, tmp, &completions, entry) {
 		list_del_init(&iod->entry);
