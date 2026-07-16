@@ -161,7 +161,7 @@ struct nvmet_mdev_cq {
 	struct nvmet_cq nvme_cq;
 	struct nvmet_mdev_mapping *mapping;
 	struct work_struct work;
-	/* Protects completions waiting for a free CQ entry. */
+	/* Shared with block-completion softirq; always acquire with irqsave. */
 	spinlock_t lock;
 	struct list_head completions;
 	atomic_t work_queued;

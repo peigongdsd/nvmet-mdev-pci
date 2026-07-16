@@ -41,7 +41,7 @@ mdev, then recreate the mdev and confirm `$MDEV/runtime_config`.
 | `inline_data` | Small PRP/SG allocations consume CPU. | `prp_heap_allocs` and `payload_sg_heap_allocs` approach zero for 4 KiB and aligned 128 KiB I/O. |
 | `pin_cache` | Repeated VFIO pin/unpin dominates random I/O. | Warm-cache `pin_cache_hits` rise while `pin_calls` and `unpin_calls` per command fall. |
 | `direct_submit` | Per-command submission work adds scheduling cost. | `submit_work_hops` becomes zero and context switches fall. |
-| `direct_complete` | Response work adds another scheduling hop. | With cached pins, `response_work_hops` becomes zero. |
+| `direct_complete` | Response work adds another scheduling hop. | With cached pins and lockless I/O, `response_work_hops` becomes zero. |
 | `lockless_io` | `ctrl->lock` serializes hot SQ/CQ paths. | Four-job scaling and task-clock per I/O improve without correctness changes. |
 | `budget_poll` | Adaptive busy polling wastes host cores. | `poll_queue_checks` per command falls without a QD1 latency regression. |
 

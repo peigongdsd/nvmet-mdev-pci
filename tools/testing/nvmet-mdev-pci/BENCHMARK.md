@@ -55,8 +55,9 @@ echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/lockless_io
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/budget_poll
 ```
 
-`direct_complete` only takes its fast path when `pinned_io` and `pin_cache` are
-also enabled. `pin_cache` is irrelevant when `pinned_io=0`. Use identical guest
-images, namespace sizes, fio versions, CPU affinity, and cache warmup for all
-runs. Cache hit rate must be reported alongside IOPS: a small cache and a large
-uniform-random working set can otherwise make the comparison misleading.
+`direct_complete` only takes its fast path when `pinned_io`, `pin_cache`, and
+`lockless_io` are also enabled. `pin_cache` is irrelevant when `pinned_io=0`.
+Use identical guest images, namespace sizes, fio versions, CPU affinity, and
+cache warmup for all runs. Cache hit rate must be reported alongside IOPS: a
+small cache and a large uniform-random working set can otherwise make the
+comparison misleading.

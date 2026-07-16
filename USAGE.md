@@ -175,13 +175,15 @@ Restore the pinned path with `echo 1`. The performance switches are:
 | `pin_cache_pages` | 16384 | Bound cached pins per controller; 16384 pages is 64 MiB with 4 KiB pages. |
 | `pin_cache_max_segs` | 1 | Admit only requests at or below this PRP-segment count to the cache. |
 | `direct_submit` | 1 | Submit a consumed SQ batch without a per-command workqueue hop. |
-| `direct_complete` | 1 | Avoid response work for cached pinned payloads. |
+| `direct_complete` | 1 | Avoid response work for cached pinned payloads when lockless I/O is active. |
 | `lockless_io` | 1 | Keep the controller mutex out of live SQ/CQ processing. |
 | `budget_poll` | 1 | Use event indices plus one bounded safety scan per idle interval. |
 | `poll_budget` | 128 | Maximum queue pairs examined by one safety scan. |
 
-`direct_complete` depends on `pinned_io=1` and `pin_cache=1`; `pin_cache` has no
-effect on the copy path. Cold consecutive cache misses are pinned in batches.
+`direct_complete` depends on `pinned_io=1`, `pin_cache=1`, and `lockless_io=1`;
+otherwise completions use response work so a softirq cannot enter the
+mutex-based controller path. `pin_cache` has no effect on the copy path. Cold
+consecutive cache misses are pinned in batches.
 The default admission limit targets repeated 4 KiB random I/O and lets larger
 sequential requests use batched request-lifetime pins, avoiding cache pollution
 and per-page cache entries for a cold stream. Raise `pin_cache_max_segs`
