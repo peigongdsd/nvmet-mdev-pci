@@ -15,11 +15,13 @@ runtime=$4
 
 test -d "/proc/$pid"
 test -r "$mdev/transport_stats"
+test -r "$mdev/runtime_config"
 mkdir -p "$output"
 
 uname -a > "$output/host-uname.txt"
 tr '\000' ' ' < "/proc/$pid/cmdline" > "$output/qemu-command.txt"
 cp "$mdev/transport_stats" "$output/transport-stats-before.txt"
+cp "$mdev/runtime_config" "$output/runtime-config.txt"
 cp /proc/interrupts "$output/interrupts-before.txt"
 
 perf stat -p "$pid" \

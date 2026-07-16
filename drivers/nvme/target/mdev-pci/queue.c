@@ -21,7 +21,43 @@
 
 static bool pinned_io = true;
 module_param_named(pinned_io, pinned_io, bool, 0644);
-MODULE_PARM_DESC(pinned_io, "Use request-lifetime pinned guest pages for I/O");
+MODULE_PARM_DESC(pinned_io, "Use pinned guest pages for I/O payloads");
+
+static bool inline_data = true;
+module_param_named(inline_data, inline_data, bool, 0644);
+MODULE_PARM_DESC(inline_data, "Use inline PRP and payload metadata for common I/O sizes");
+
+static bool pin_cache = true;
+module_param_named(pin_cache, pin_cache, bool, 0644);
+MODULE_PARM_DESC(pin_cache, "Cache pinned guest payload pages between requests");
+
+static uint pin_cache_pages = 16384;
+module_param_named(pin_cache_pages, pin_cache_pages, uint, 0644);
+MODULE_PARM_DESC(pin_cache_pages, "Maximum cached guest pages per controller");
+
+static uint pin_cache_max_segs = 1;
+module_param_named(pin_cache_max_segs, pin_cache_max_segs, uint, 0644);
+MODULE_PARM_DESC(pin_cache_max_segs, "Maximum PRP segments admitted to the pin cache");
+
+static bool direct_submit = true;
+module_param_named(direct_submit, direct_submit, bool, 0644);
+MODULE_PARM_DESC(direct_submit, "Submit nvmet requests directly from the SQ batch worker");
+
+static bool direct_complete = true;
+module_param_named(direct_complete, direct_complete, bool, 0644);
+MODULE_PARM_DESC(direct_complete, "Queue cached-payload completions without response work");
+
+static bool lockless_io = true;
+module_param_named(lockless_io, lockless_io, bool, 0644);
+MODULE_PARM_DESC(lockless_io, "Avoid the controller mutex in live SQ/CQ processing");
+
+static bool budget_poll = true;
+module_param_named(budget_poll, budget_poll, bool, 0644);
+MODULE_PARM_DESC(budget_poll, "Use event-index-driven bounded DBBUF polling");
+
+static uint poll_budget = 128;
+module_param_named(poll_budget, poll_budget, uint, 0644);
+MODULE_PARM_DESC(poll_budget, "Maximum queues examined by one bounded DBBUF poll run");
 
 struct nvmet_mdev_iod {
 	struct list_head entry;
@@ -36,6 +72,8 @@ struct nvmet_mdev_iod {
 	refcount_t refs;
 	struct nvmet_mdev_payload payload;
 	struct nvmet_mdev_iova_segment *segments;
+	struct nvmet_mdev_iova_segment inline_segments[NVMET_MDEV_INLINE_SEGS];
+	__le64 inline_prps[NVMET_MDEV_INLINE_SEGS];
 	unsigned int nr_segments;
 	size_t data_len;
 	bool host_to_ctrl;
@@ -48,7 +86,8 @@ static void nvmet_mdev_free_iod(struct nvmet_mdev_iod *iod)
 		nvmet_mdev_unpin_payload(iod->ctrl, &iod->payload);
 	if (iod->req.sg && !iod->pinned)
 		nvmet_req_free_sgls(&iod->req);
-	kfree(iod->segments);
+	if (iod->segments != iod->inline_segments)
+		kfree(iod->segments);
 	mempool_free(iod, &iod->ctrl->iod_pool);
 }
 
@@ -64,6 +103,7 @@ static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
 	size_t remaining = iod->data_len;
 	__le64 *prps = NULL;
 	u64 prp, list_iova;
+	unsigned int max_segments;
 	int ret = 0;
 
 	if (!remaining)
@@ -71,15 +111,23 @@ static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
 	if (remaining > NVMET_MDEV_COPY_MAX_DATA)
 		return -E2BIG;
 
-	iod->segments = kcalloc(NVMET_MDEV_MAX_SEGS,
-				sizeof(*iod->segments), GFP_KERNEL);
-	if (!iod->segments)
-		return -ENOMEM;
-
 	prp = le64_to_cpu(cmd->common.dptr.prp1);
 	if (!prp || !IS_ALIGNED(prp, sizeof(u32))) {
 		ret = -EINVAL;
 		goto out;
+	}
+	max_segments = DIV_ROUND_UP((prp & (SZ_4K - 1)) + remaining, SZ_4K);
+	if (iod->ctrl->runtime.inline_data &&
+	    max_segments <= NVMET_MDEV_INLINE_SEGS) {
+		iod->segments = iod->inline_segments;
+	} else {
+		if (!iod->ctrl->runtime.inline_data)
+			max_segments = NVMET_MDEV_MAX_SEGS;
+		iod->segments = kcalloc(max_segments, sizeof(*iod->segments),
+					GFP_KERNEL);
+		if (!iod->segments)
+			return -ENOMEM;
+		atomic64_inc(&iod->ctrl->stats.prp_heap_allocs);
 	}
 
 	{
@@ -104,10 +152,16 @@ static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
 		goto out;
 	}
 
-	prps = kmalloc(SZ_4K, GFP_KERNEL);
-	if (!prps) {
-		ret = -ENOMEM;
-		goto out;
+	if (iod->ctrl->runtime.inline_data &&
+	    DIV_ROUND_UP(remaining, SZ_4K) <= NVMET_MDEV_INLINE_SEGS) {
+		prps = iod->inline_prps;
+	} else {
+		prps = kmalloc(SZ_4K, GFP_KERNEL);
+		if (!prps) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		atomic64_inc(&iod->ctrl->stats.prp_heap_allocs);
 	}
 	list_iova = prp;
 
@@ -139,7 +193,7 @@ static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
 			}
 
 			length = min_t(size_t, remaining, SZ_4K);
-			if (iod->nr_segments >= NVMET_MDEV_MAX_SEGS) {
+			if (iod->nr_segments >= max_segments) {
 				ret = -E2BIG;
 				goto out;
 			}
@@ -155,7 +209,8 @@ static int nvmet_mdev_collect_prps(struct nvmet_mdev_iod *iod)
 	}
 
 out:
-	kfree(prps);
+	if (prps != iod->inline_prps)
+		kfree(prps);
 	return ret;
 }
 
@@ -224,24 +279,25 @@ static u32 nvmet_mdev_cq_head(struct nvmet_mdev_ctrl *ctrl,
 				  (cq->qid * 2 + 1) * sizeof(u32));
 }
 
-static void nvmet_mdev_poll_work(struct work_struct *work)
+static void nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq);
+
+static void nvmet_mdev_legacy_poll(struct nvmet_mdev_ctrl *ctrl)
 {
-	struct nvmet_mdev_ctrl *ctrl =
-		container_of(to_delayed_work(work), struct nvmet_mdev_ctrl,
-			     poll_work);
 	unsigned int qid;
-	u64 scans = 0;
+	u64 runs = 0;
+	u64 queue_checks = 0;
 
 	for (;;) {
 		bool activity = false;
 		bool raced = false;
 
-		scans++;
+		runs++;
 
 		mutex_lock(&ctrl->lock);
 		if (!ctrl->enabled || !ctrl->dbbuf_dbs || !ctrl->dbbuf_eis) {
 			mutex_unlock(&ctrl->lock);
-			atomic64_add(scans, &ctrl->stats.poll_scans);
+			atomic64_add(runs, &ctrl->stats.poll_runs);
+			atomic64_add(queue_checks, &ctrl->stats.poll_queue_checks);
 			return;
 		}
 
@@ -250,6 +306,7 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 			struct nvmet_mdev_cq *cq = &ctrl->cqs[qid];
 			u32 value;
 
+			queue_checks++;
 			if (sq->live) {
 				value = nvmet_mdev_sq_tail(ctrl, sq);
 				if (value != READ_ONCE(sq->head)) {
@@ -260,7 +317,7 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 			if (cq->live) {
 				value = nvmet_mdev_cq_head(ctrl, cq);
 				if (value != READ_ONCE(cq->head)) {
-					schedule_work(&cq->work);
+					nvmet_mdev_queue_cq_work(cq);
 					activity = true;
 				}
 			}
@@ -272,6 +329,7 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 			for (qid = 1; qid < ctrl->nr_queues; qid++) {
 				u32 value;
 
+				queue_checks++;
 				if (ctrl->sqs[qid].live) {
 					value = nvmet_mdev_sq_tail(ctrl, &ctrl->sqs[qid]) - 1;
 					WRITE_ONCE(ctrl->dbbuf_eis[qid * 2],
@@ -292,6 +350,7 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 		for (qid = 1; qid < ctrl->nr_queues; qid++) {
 			u32 value;
 
+			queue_checks++;
 			if (ctrl->sqs[qid].live) {
 				value = nvmet_mdev_sq_tail(ctrl, &ctrl->sqs[qid]);
 				WRITE_ONCE(ctrl->dbbuf_eis[qid * 2],
@@ -306,6 +365,7 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 		/* Publish event indices before checking for a racing doorbell. */
 		mb();
 		for (qid = 1; qid < ctrl->nr_queues; qid++) {
+			queue_checks++;
 			if (ctrl->sqs[qid].live &&
 			    nvmet_mdev_sq_tail(ctrl, &ctrl->sqs[qid]) !=
 			    le32_to_cpu(READ_ONCE(ctrl->dbbuf_eis[qid * 2])))
@@ -321,24 +381,122 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 		if (!raced) {
 			schedule_delayed_work(&ctrl->poll_work,
 					      NVMET_MDEV_POLL_INTERVAL);
-			atomic64_add(scans, &ctrl->stats.poll_scans);
+			atomic64_add(runs, &ctrl->stats.poll_runs);
+			atomic64_add(queue_checks, &ctrl->stats.poll_queue_checks);
 			return;
 		}
 	}
+}
+
+static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
+{
+	unsigned int qid, limit, scanned = 0;
+	bool enabled;
+
+	atomic64_inc(&ctrl->stats.poll_wakeups);
+	atomic64_inc(&ctrl->stats.poll_runs);
+	if (!ctrl->runtime.lockless_io)
+		mutex_lock(&ctrl->lock);
+	enabled = READ_ONCE(ctrl->enabled) && READ_ONCE(ctrl->dbbuf_dbs) &&
+		  READ_ONCE(ctrl->dbbuf_eis);
+	if (!enabled)
+		goto unlock;
+
+	if (ctrl->nr_queues <= 1)
+		goto account;
+	qid = ctrl->poll_next_qid;
+	limit = min_t(unsigned int, ctrl->runtime.poll_budget,
+		      ctrl->nr_queues - 1);
+	while (scanned < limit) {
+		struct nvmet_mdev_sq *sq = &ctrl->sqs[qid];
+		struct nvmet_mdev_cq *cq = &ctrl->cqs[qid];
+
+		if (READ_ONCE(sq->live) && nvmet_mdev_sq_tail(ctrl, sq) !=
+		    READ_ONCE(sq->head))
+			schedule_work(&sq->work);
+		if (READ_ONCE(cq->live) && nvmet_mdev_cq_head(ctrl, cq) !=
+		    READ_ONCE(cq->head))
+			nvmet_mdev_queue_cq_work(cq);
+		scanned++;
+		qid++;
+		if (qid == ctrl->nr_queues)
+			qid = 1;
+	}
+	ctrl->poll_next_qid = qid;
+account:
+	atomic64_add(scanned, &ctrl->stats.poll_queue_checks);
+unlock:
+	if (!ctrl->runtime.lockless_io)
+		mutex_unlock(&ctrl->lock);
+	if (enabled) {
+		atomic64_inc(&ctrl->stats.poll_sleeps);
+		schedule_delayed_work(&ctrl->poll_work,
+				      NVMET_MDEV_POLL_INTERVAL);
+	}
+}
+
+static void nvmet_mdev_poll_work(struct work_struct *work)
+{
+	struct nvmet_mdev_ctrl *ctrl =
+		container_of(to_delayed_work(work), struct nvmet_mdev_ctrl,
+			     poll_work);
+
+	if (ctrl->runtime.budget_poll)
+		nvmet_mdev_budget_poll(ctrl);
+	else
+		nvmet_mdev_legacy_poll(ctrl);
 }
 
 static void nvmet_mdev_kick_poller(struct nvmet_mdev_ctrl *ctrl)
 {
 	bool enabled;
 
-	mutex_lock(&ctrl->lock);
-	enabled = ctrl->enabled && ctrl->dbbuf_dbs;
-	if (enabled)
+	if (!ctrl->runtime.lockless_io)
+		mutex_lock(&ctrl->lock);
+	enabled = READ_ONCE(ctrl->enabled) && READ_ONCE(ctrl->dbbuf_dbs);
+	if (enabled && !ctrl->runtime.budget_poll)
 		ctrl->poll_busy_until = jiffies + NVMET_MDEV_POLL_BUSY;
-	mutex_unlock(&ctrl->lock);
+	if (!ctrl->runtime.lockless_io)
+		mutex_unlock(&ctrl->lock);
 	if (!enabled)
 		return;
 	mod_delayed_work(system_wq, &ctrl->poll_work, 0);
+}
+
+static void nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq)
+{
+	if (atomic_cmpxchg(&cq->work_queued, 0, 1) == 0)
+		schedule_work(&cq->work);
+}
+
+static bool nvmet_mdev_arm_sq_event(struct nvmet_mdev_ctrl *ctrl,
+				    struct nvmet_mdev_sq *sq)
+{
+	u32 tail;
+
+	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(sq->live) || !sq->qid ||
+	    !READ_ONCE(ctrl->dbbuf_dbs) || !READ_ONCE(ctrl->dbbuf_eis))
+		return false;
+	tail = nvmet_mdev_sq_tail(ctrl, sq);
+	WRITE_ONCE(ctrl->dbbuf_eis[sq->qid * 2], cpu_to_le32(tail));
+	/* Pair with the guest's shadow-doorbell write and event-index read. */
+	mb();
+	return nvmet_mdev_sq_tail(ctrl, sq) != tail;
+}
+
+static bool nvmet_mdev_arm_cq_event(struct nvmet_mdev_ctrl *ctrl,
+				    struct nvmet_mdev_cq *cq)
+{
+	u32 head;
+
+	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live) || !cq->qid ||
+	    !READ_ONCE(ctrl->dbbuf_dbs) || !READ_ONCE(ctrl->dbbuf_eis))
+		return false;
+	head = nvmet_mdev_cq_head(ctrl, cq);
+	WRITE_ONCE(ctrl->dbbuf_eis[cq->qid * 2 + 1], cpu_to_le32(head));
+	/* Pair with the guest's shadow-doorbell write and event-index read. */
+	mb();
+	return nvmet_mdev_cq_head(ctrl, cq) != head;
 }
 
 static void nvmet_mdev_complete_iod(struct nvmet_mdev_iod *iod)
@@ -346,24 +504,30 @@ static void nvmet_mdev_complete_iod(struct nvmet_mdev_iod *iod)
 	struct nvmet_mdev_cq *cq = iod->cq;
 	struct nvmet_mdev_ctrl *ctrl = iod->ctrl;
 
-	mutex_lock(&ctrl->lock);
-	if (!ctrl->enabled || !cq->live) {
-		mutex_unlock(&ctrl->lock);
-		nvmet_mdev_put_iod(iod);
-		return;
+	if (ctrl->runtime.lockless_io) {
+		if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live)) {
+			nvmet_mdev_put_iod(iod);
+			return;
+		}
+	} else {
+		mutex_lock(&ctrl->lock);
+		if (!ctrl->enabled || !cq->live) {
+			mutex_unlock(&ctrl->lock);
+			nvmet_mdev_put_iod(iod);
+			return;
+		}
 	}
 
 	spin_lock(&cq->lock);
 	list_add_tail(&iod->entry, &cq->completions);
 	spin_unlock(&cq->lock);
-	schedule_work(&cq->work);
-	mutex_unlock(&ctrl->lock);
+	nvmet_mdev_queue_cq_work(cq);
+	if (!ctrl->runtime.lockless_io)
+		mutex_unlock(&ctrl->lock);
 }
 
-static void nvmet_mdev_response_work(struct work_struct *work)
+static void nvmet_mdev_response_iod(struct nvmet_mdev_iod *iod)
 {
-	struct nvmet_mdev_iod *iod =
-		container_of(work, struct nvmet_mdev_iod, response_work);
 	struct nvmet_req *req = &iod->req;
 	u16 status = le16_to_cpu(req->cqe->status) >> 1;
 	int ret;
@@ -386,22 +550,36 @@ static void nvmet_mdev_response_work(struct work_struct *work)
 	nvmet_mdev_complete_iod(iod);
 }
 
-static void nvmet_mdev_submit_work(struct work_struct *work)
+static void nvmet_mdev_response_work(struct work_struct *work)
 {
 	struct nvmet_mdev_iod *iod =
-		container_of(work, struct nvmet_mdev_iod, submit_work);
+		container_of(work, struct nvmet_mdev_iod, response_work);
+
+	nvmet_mdev_response_iod(iod);
+}
+
+static void nvmet_mdev_submit_iod(struct nvmet_mdev_iod *iod)
+{
 	struct nvmet_req *req = &iod->req;
 	u16 status;
 	int ret;
 
-	mutex_lock(&iod->ctrl->lock);
-	if (!iod->ctrl->enabled || !iod->sq->live) {
+	if (iod->ctrl->runtime.lockless_io) {
+		if (!READ_ONCE(iod->ctrl->enabled) || !READ_ONCE(iod->sq->live)) {
+			nvmet_mdev_put_iod(iod);
+			nvmet_mdev_put_iod(iod);
+			return;
+		}
+	} else {
+		mutex_lock(&iod->ctrl->lock);
+		if (!iod->ctrl->enabled || !iod->sq->live) {
+			mutex_unlock(&iod->ctrl->lock);
+			nvmet_mdev_put_iod(iod);
+			nvmet_mdev_put_iod(iod);
+			return;
+		}
 		mutex_unlock(&iod->ctrl->lock);
-		nvmet_mdev_put_iod(iod);
-		nvmet_mdev_put_iod(iod);
-		return;
 	}
-	mutex_unlock(&iod->ctrl->lock);
 
 	if (!nvmet_req_init(req, &iod->sq->nvme_sq,
 			    &nvmet_mdev_fabrics_ops)) {
@@ -428,7 +606,7 @@ static void nvmet_mdev_submit_work(struct work_struct *work)
 			goto complete;
 		}
 
-		if (pinned_io && iod->sq->qid) {
+		if (iod->ctrl->runtime.pinned_io && iod->sq->qid) {
 			ret = nvmet_mdev_pin_payload(iod->ctrl, iod->segments,
 						     iod->nr_segments,
 						     iod->host_to_ctrl ?
@@ -467,6 +645,14 @@ complete:
 	nvmet_mdev_put_iod(iod);
 }
 
+static void nvmet_mdev_submit_work(struct work_struct *work)
+{
+	struct nvmet_mdev_iod *iod =
+		container_of(work, struct nvmet_mdev_iod, submit_work);
+
+	nvmet_mdev_submit_iod(iod);
+}
+
 static void nvmet_mdev_sq_work(struct work_struct *work)
 {
 	struct nvmet_mdev_sq *sq =
@@ -479,22 +665,32 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 	LIST_HEAD(submissions);
 	u32 tail;
 
-	mutex_lock(&ctrl->lock);
-	if (!ctrl->enabled || !sq->live)
+	atomic64_inc(&ctrl->stats.sq_work_runs);
+	if (!ctrl->runtime.lockless_io)
+		mutex_lock(&ctrl->lock);
+	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(sq->live))
 		goto unlock;
 
 	tail = nvmet_mdev_sq_tail(ctrl, sq);
 	if (tail >= sq->depth) {
-		ctrl->enabled = false;
+		if (ctrl->runtime.lockless_io)
+			mutex_lock(&ctrl->lock);
+		WRITE_ONCE(ctrl->enabled, false);
 		nvmet_mdev_pci_set_fatal(ctrl);
+		if (ctrl->runtime.lockless_io)
+			mutex_unlock(&ctrl->lock);
 		goto unlock;
 	}
 
 	while (sq->head != tail && processed < NVMET_MDEV_BATCH_SIZE) {
 		iod = mempool_alloc(&ctrl->iod_pool, GFP_KERNEL);
 		if (!iod) {
-			ctrl->enabled = false;
+			if (ctrl->runtime.lockless_io)
+				mutex_lock(&ctrl->lock);
+			WRITE_ONCE(ctrl->enabled, false);
 			nvmet_mdev_pci_set_fatal(ctrl);
+			if (ctrl->runtime.lockless_io)
+				mutex_unlock(&ctrl->lock);
 			failed = true;
 			break;
 		}
@@ -520,19 +716,32 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 	}
 	more = sq->head != tail;
 	atomic64_add(processed, &ctrl->stats.commands);
+	if (processed)
+		atomic64_inc(&ctrl->stats.sq_batches);
 
 unlock:
-	mutex_unlock(&ctrl->lock);
+	if (!ctrl->runtime.lockless_io)
+		mutex_unlock(&ctrl->lock);
 	list_for_each_entry_safe(iod, tmp, &submissions, entry) {
 		list_del_init(&iod->entry);
-		if (failed || !queue_work(sq->iod_wq, &iod->submit_work)) {
+		if (failed) {
 			nvmet_mdev_put_iod(iod);
 			nvmet_mdev_put_iod(iod);
+		} else if (ctrl->runtime.direct_submit) {
+			nvmet_mdev_submit_iod(iod);
+		} else if (!queue_work(sq->iod_wq, &iod->submit_work)) {
+			nvmet_mdev_put_iod(iod);
+			nvmet_mdev_put_iod(iod);
+		} else {
+			atomic64_inc(&ctrl->stats.submit_work_hops);
 		}
 	}
 	if (more && !failed)
 		schedule_work(&sq->work);
-	if (processed)
+	else if (ctrl->runtime.budget_poll && !failed &&
+		 nvmet_mdev_arm_sq_event(ctrl, sq))
+		schedule_work(&sq->work);
+	if (processed && !ctrl->runtime.budget_poll)
 		nvmet_mdev_kick_poller(ctrl);
 }
 
@@ -541,59 +750,92 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 	struct nvmet_mdev_cq *cq =
 		container_of(work, struct nvmet_mdev_cq, work);
 	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
-	unsigned int completed = 0;
+	unsigned int completed;
 	struct nvmet_mdev_iod *iod, *tmp;
-	LIST_HEAD(done);
+	bool blocked;
 	u32 head;
 
-	mutex_lock(&ctrl->lock);
-	if (!ctrl->enabled || !cq->live)
-		goto unlock;
+	atomic64_inc(&ctrl->stats.cq_work_runs);
+again:
+	completed = 0;
+	{
+		LIST_HEAD(done);
 
-	head = nvmet_mdev_cq_head(ctrl, cq);
-	if (head >= cq->depth) {
-		ctrl->enabled = false;
-		nvmet_mdev_pci_set_fatal(ctrl);
-		goto unlock;
-	}
-	cq->head = head;
+		if (!ctrl->runtime.lockless_io)
+			mutex_lock(&ctrl->lock);
+		if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live))
+			goto unlock;
 
-	spin_lock(&cq->lock);
-	while (!list_empty(&cq->completions) &&
-	       !nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
-		struct nvme_completion cqe;
-		u16 status;
+		head = nvmet_mdev_cq_head(ctrl, cq);
+		if (head >= cq->depth) {
+			if (ctrl->runtime.lockless_io)
+				mutex_lock(&ctrl->lock);
+			WRITE_ONCE(ctrl->enabled, false);
+			nvmet_mdev_pci_set_fatal(ctrl);
+			if (ctrl->runtime.lockless_io)
+				mutex_unlock(&ctrl->lock);
+			goto unlock;
+		}
+		cq->head = head;
 
-		iod = list_first_entry(&cq->completions,
-				       struct nvmet_mdev_iod, entry);
-		list_del_init(&iod->entry);
+		spin_lock(&cq->lock);
+		while (!list_empty(&cq->completions) &&
+		       !nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
+			struct nvme_completion cqe;
+			u16 status;
 
-		cqe = iod->cqe;
-		status = le16_to_cpu(cqe.status) >> 1;
-		nvmet_pci_prepare_cqe(&cqe, le16_to_cpu(cqe.sq_head),
-				      le16_to_cpu(cqe.sq_id), cqe.command_id,
-				      status, cq->phase);
-		memcpy(cq->entries + cq->tail * sizeof(cqe), &cqe, sizeof(cqe));
-		nvmet_pci_advance_cq_tail(&cq->tail, &cq->phase, cq->depth);
-		list_add_tail(&iod->entry, &done);
-		completed++;
-	}
-	spin_unlock(&cq->lock);
-	if (completed)
-		dma_wmb();
-	atomic64_add(completed, &ctrl->stats.completions);
+			iod = list_first_entry(&cq->completions,
+					       struct nvmet_mdev_iod, entry);
+			list_del_init(&iod->entry);
+
+			cqe = iod->cqe;
+			status = le16_to_cpu(cqe.status) >> 1;
+			nvmet_pci_prepare_cqe(&cqe, le16_to_cpu(cqe.sq_head),
+					      le16_to_cpu(cqe.sq_id), cqe.command_id,
+					      status, cq->phase);
+			memcpy(cq->entries + cq->tail * sizeof(cqe), &cqe,
+			       sizeof(cqe));
+			nvmet_pci_advance_cq_tail(&cq->tail, &cq->phase,
+						  cq->depth);
+			list_add_tail(&iod->entry, &done);
+			completed++;
+		}
+		spin_unlock(&cq->lock);
+		if (completed)
+			dma_wmb();
+		atomic64_add(completed, &ctrl->stats.completions);
+		if (completed)
+			atomic64_inc(&ctrl->stats.cq_batches);
 
 unlock:
-	mutex_unlock(&ctrl->lock);
-	list_for_each_entry_safe(iod, tmp, &done, entry) {
-		list_del_init(&iod->entry);
-		nvmet_mdev_put_iod(iod);
+		if (!ctrl->runtime.lockless_io)
+			mutex_unlock(&ctrl->lock);
+		list_for_each_entry_safe(iod, tmp, &done, entry) {
+			list_del_init(&iod->entry);
+			nvmet_mdev_put_iod(iod);
+		}
 	}
 
 	if (completed && cq->irq_enabled)
 		nvmet_mdev_notify_irq(ctrl, cq->vector, completed, !cq->qid);
-	if (completed)
+	if (completed && !ctrl->runtime.budget_poll)
 		nvmet_mdev_kick_poller(ctrl);
+
+	spin_lock(&cq->lock);
+	blocked = !list_empty(&cq->completions) &&
+		  nvmet_pci_cq_full(cq->head, cq->tail, cq->depth);
+	if (READ_ONCE(ctrl->enabled) && READ_ONCE(cq->live) &&
+	    !list_empty(&cq->completions) &&
+	    !nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
+		spin_unlock(&cq->lock);
+		goto again;
+	}
+	atomic_set(&cq->work_queued, 0);
+	spin_unlock(&cq->lock);
+	if (ctrl->runtime.budget_poll && blocked && READ_ONCE(ctrl->enabled) &&
+	    READ_ONCE(cq->live) &&
+	    nvmet_mdev_arm_cq_event(ctrl, cq))
+		nvmet_mdev_queue_cq_work(cq);
 }
 
 void nvmet_mdev_queue_response(struct nvmet_req *req)
@@ -601,8 +843,15 @@ void nvmet_mdev_queue_response(struct nvmet_req *req)
 	struct nvmet_mdev_iod *iod =
 		container_of(req, struct nvmet_mdev_iod, req);
 
+	if (iod->ctrl->runtime.direct_complete && iod->pinned &&
+	    iod->payload.cached) {
+		nvmet_mdev_response_iod(iod);
+		return;
+	}
 	if (!queue_work(iod->sq->iod_wq, &iod->response_work))
 		nvmet_mdev_put_iod(iod);
+	else
+		atomic64_inc(&iod->ctrl->stats.response_work_hops);
 }
 
 static void nvmet_mdev_drain_completions(struct nvmet_mdev_cq *cq)
@@ -624,8 +873,19 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 {
 	unsigned int qid;
 
+	ctrl->runtime.pinned_io = READ_ONCE(pinned_io);
+	ctrl->runtime.inline_data = READ_ONCE(inline_data);
+	ctrl->runtime.pin_cache = READ_ONCE(pin_cache);
+	ctrl->runtime.direct_submit = READ_ONCE(direct_submit);
+	ctrl->runtime.direct_complete = READ_ONCE(direct_complete);
+	ctrl->runtime.lockless_io = READ_ONCE(lockless_io);
+	ctrl->runtime.budget_poll = READ_ONCE(budget_poll);
+	ctrl->runtime.pin_cache_pages = READ_ONCE(pin_cache_pages);
+	ctrl->runtime.pin_cache_max_segs = READ_ONCE(pin_cache_max_segs);
+	ctrl->runtime.poll_budget = max_t(unsigned int, READ_ONCE(poll_budget), 1);
 	mutex_init(&ctrl->state_lock);
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);
+	ctrl->poll_next_qid = 1;
 	ctrl->nr_queues = ctrl->tctrl->subsys->max_qid + 1;
 	if (mempool_init_kmalloc_pool(&ctrl->iod_pool,
 				      min_t(unsigned int, ctrl->nr_queues * 32,
@@ -659,6 +919,7 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		cq->qid = qid;
 		spin_lock_init(&cq->lock);
 		INIT_LIST_HEAD(&cq->completions);
+		atomic_set(&cq->work_queued, 0);
 		INIT_WORK(&cq->work, nvmet_mdev_cq_work);
 	}
 
@@ -852,6 +1113,7 @@ static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 	mutex_unlock(&ctrl->lock);
 
 	cancel_work_sync(&cq->work);
+	atomic_set(&cq->work_queued, 0);
 	nvmet_mdev_drain_completions(cq);
 	nvmet_cq_put(&cq->nvme_cq);
 
@@ -893,7 +1155,6 @@ static void __nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	ctrl->enabled = false;
 	mutex_unlock(&ctrl->lock);
 	cancel_delayed_work_sync(&ctrl->poll_work);
-	nvmet_mdev_disable_dbbuf(ctrl);
 
 	for (qid = ctrl->nr_queues; qid-- > 0;)
 		if (ctrl->sqs[qid].live)
@@ -901,6 +1162,8 @@ static void __nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	for (qid = ctrl->nr_queues; qid-- > 0;)
 		if (ctrl->cqs[qid].live)
 			nvmet_mdev_delete_cq_locked(ctrl, qid);
+	/* Queue workers may access shadow doorbells until both queue sets drain. */
+	nvmet_mdev_disable_dbbuf(ctrl);
 	nvmet_mdev_irq_quiesce(ctrl);
 
 	if (!ctrl->tctrl)
@@ -925,7 +1188,9 @@ int nvmet_mdev_enable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 		mutex_unlock(&ctrl->lock);
 		goto out_unlock_state;
 	}
+	mutex_lock(&ctrl->dma_lock);
 	ctrl->dma_blocked = false;
+	mutex_unlock(&ctrl->dma_lock);
 	cap = get_unaligned_le64(ctrl->bar0 + NVME_REG_CAP);
 	aqa = get_unaligned_le32(ctrl->bar0 + NVME_REG_AQA);
 	asq = get_unaligned_le64(ctrl->bar0 + NVME_REG_ASQ);
@@ -953,8 +1218,10 @@ int nvmet_mdev_enable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 
 	mutex_lock(&ctrl->lock);
 	ctrl->enabled = true;
-	ctrl->dma_blocked = false;
 	mutex_unlock(&ctrl->lock);
+	mutex_lock(&ctrl->dma_lock);
+	ctrl->dma_blocked = false;
+	mutex_unlock(&ctrl->dma_lock);
 	nvmet_update_cc(ctrl->tctrl, cc);
 	mutex_lock(&ctrl->lock);
 	put_unaligned_le32(ctrl->tctrl->csts, ctrl->bar0 + NVME_REG_CSTS);
@@ -1009,17 +1276,19 @@ void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 				  bool cq)
 {
 	atomic64_inc(&ctrl->stats.doorbell_kicks);
-	mutex_lock(&ctrl->lock);
-	if (!ctrl->enabled || qid >= ctrl->nr_queues)
+	if (!ctrl->runtime.lockless_io)
+		mutex_lock(&ctrl->lock);
+	if (!READ_ONCE(ctrl->enabled) || qid >= ctrl->nr_queues)
 		goto out_unlock;
 	if (cq) {
-		if (ctrl->cqs[qid].live)
-			schedule_work(&ctrl->cqs[qid].work);
-	} else if (ctrl->sqs[qid].live) {
+		if (READ_ONCE(ctrl->cqs[qid].live))
+			nvmet_mdev_queue_cq_work(&ctrl->cqs[qid]);
+	} else if (READ_ONCE(ctrl->sqs[qid].live)) {
 		schedule_work(&ctrl->sqs[qid].work);
 	}
 out_unlock:
-	mutex_unlock(&ctrl->lock);
+	if (!ctrl->runtime.lockless_io)
+		mutex_unlock(&ctrl->lock);
 	nvmet_mdev_kick_poller(ctrl);
 }
 
@@ -1036,9 +1305,16 @@ u16 nvmet_mdev_create_sq(struct nvmet_ctrl *tctrl, u16 sqid, u16 cqid,
 
 	if (!ctrl)
 		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
-	mutex_lock(&ctrl->state_lock);
+	/* Teardown may hold state_lock while draining this admin request. */
+	if (!mutex_trylock(&ctrl->state_lock))
+		return NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
+	if (!READ_ONCE(ctrl->enabled)) {
+		status = NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
+		goto out_unlock;
+	}
 	status = nvmet_mdev_create_sq_locked(ctrl, sqid, cqid, flags,
 					     qsize + 1, prp1);
+out_unlock:
 	mutex_unlock(&ctrl->state_lock);
 	return status;
 }
@@ -1050,8 +1326,14 @@ u16 nvmet_mdev_delete_sq(struct nvmet_ctrl *tctrl, u16 sqid)
 
 	if (!ctrl)
 		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
-	mutex_lock(&ctrl->state_lock);
+	if (!mutex_trylock(&ctrl->state_lock))
+		return NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
+	if (!READ_ONCE(ctrl->enabled)) {
+		status = NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
+		goto out_unlock;
+	}
 	status = nvmet_mdev_delete_sq_locked(ctrl, sqid);
+out_unlock:
 	mutex_unlock(&ctrl->state_lock);
 	return status;
 }
@@ -1064,9 +1346,15 @@ u16 nvmet_mdev_create_cq(struct nvmet_ctrl *tctrl, u16 cqid, u16 flags,
 
 	if (!ctrl)
 		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
-	mutex_lock(&ctrl->state_lock);
+	if (!mutex_trylock(&ctrl->state_lock))
+		return NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
+	if (!READ_ONCE(ctrl->enabled)) {
+		status = NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
+		goto out_unlock;
+	}
 	status = nvmet_mdev_create_cq_locked(ctrl, cqid, flags, qsize + 1,
 					     prp1, irq_vector);
+out_unlock:
 	mutex_unlock(&ctrl->state_lock);
 	return status;
 }
@@ -1078,8 +1366,14 @@ u16 nvmet_mdev_delete_cq(struct nvmet_ctrl *tctrl, u16 cqid)
 
 	if (!ctrl)
 		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
-	mutex_lock(&ctrl->state_lock);
+	if (!mutex_trylock(&ctrl->state_lock))
+		return NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
+	if (!READ_ONCE(ctrl->enabled)) {
+		status = NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
+		goto out_unlock;
+	}
 	status = nvmet_mdev_delete_cq_locked(ctrl, cqid);
+out_unlock:
 	mutex_unlock(&ctrl->state_lock);
 	return status;
 }
