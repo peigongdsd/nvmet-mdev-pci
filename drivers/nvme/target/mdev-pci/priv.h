@@ -136,8 +136,6 @@ struct nvmet_mdev_stats {
 	local64_t iod_cache_misses;
 	local64_t sq_work_runs;
 	local64_t cq_work_runs;
-	local64_t sq_batches;
-	local64_t cq_batches;
 	local64_t poll_wakeups;
 	local64_t poll_sleeps;
 	local64_t fast_doorbell_writes;

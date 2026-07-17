@@ -16,7 +16,7 @@
 #define NVMET_MDEV_COPY_MAX_DATA	SZ_1M
 #define NVMET_MDEV_PRP_ENTRIES		(SZ_4K / sizeof(__le64))
 #define NVMET_MDEV_MAX_SEGS		(NVMET_MDEV_COPY_MAX_DATA / SZ_4K + 1)
-#define NVMET_MDEV_BATCH_SIZE		64
+#define NVMET_MDEV_QUEUE_WORK_BUDGET	64
 
 static_assert(offsetof(struct nvme_completion, status) +
 	      sizeof_field(struct nvme_completion, status) ==
@@ -686,10 +686,8 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 		container_of(work, struct nvmet_mdev_sq, work);
 	struct nvmet_mdev_ctrl *ctrl = sq->ctrl;
 	unsigned int processed = 0;
-	struct nvmet_mdev_iod *iod, *tmp;
 	bool more = false;
 	bool failed = false;
-	LIST_HEAD(submissions);
 	u32 tail;
 
 	nvmet_mdev_stat_inc(ctrl, sq_work_runs);
@@ -706,7 +704,10 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 		goto unlock;
 	}
 
-	while (sq->head != tail && processed < NVMET_MDEV_BATCH_SIZE) {
+	while (sq->head != tail &&
+	       processed < NVMET_MDEV_QUEUE_WORK_BUDGET) {
+		struct nvmet_mdev_iod *iod;
+
 		iod = nvmet_mdev_alloc_iod(ctrl);
 		if (!iod) {
 			mutex_lock(&ctrl->lock);
@@ -729,24 +730,13 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 		       sq->entries + sq->head * sizeof(struct nvme_command),
 		       sizeof(iod->cmd));
 		nvmet_pci_advance_sq_head(&sq->head, sq->depth);
-		list_add_tail(&iod->entry, &submissions);
 		processed++;
+		nvmet_mdev_submit_iod(iod);
 	}
 	more = sq->head != tail;
 	nvmet_mdev_stat_add(ctrl, commands, processed);
-	if (processed)
-		nvmet_mdev_stat_inc(ctrl, sq_batches);
 
 unlock:
-	list_for_each_entry_safe(iod, tmp, &submissions, entry) {
-		list_del_init(&iod->entry);
-		if (failed) {
-			nvmet_mdev_put_iod(iod);
-			nvmet_mdev_put_iod(iod);
-		} else {
-			nvmet_mdev_submit_iod(iod);
-		}
-	}
 	if (!failed && READ_ONCE(ctrl->enabled) &&
 	    smp_load_acquire(&sq->live) &&
 	    (more || atomic_xchg(&sq->kick_pending, 0) ||
@@ -775,13 +765,7 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 	struct nvmet_mdev_cq *cq =
 		container_of(work, struct nvmet_mdev_cq, work);
 	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
-	struct {
-		struct nvmet_mdev_iod *iod;
-		struct nvme_completion *dst;
-		__le16 status;
-	} posted[NVMET_MDEV_BATCH_SIZE];
 	unsigned int completed = 0;
-	u16 tail, phase;
 	u32 head;
 	bool blocked = false;
 
@@ -801,13 +785,15 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 	if (head != atomic_read(&cq->head))
 		nvmet_mdev_handle_cq_head(cq, true);
 
-	tail = READ_ONCE(cq->tail);
-	phase = READ_ONCE(cq->phase);
-	while (completed < NVMET_MDEV_BATCH_SIZE &&
-	       !nvmet_pci_cq_full(atomic_read(&cq->head), tail, cq->depth)) {
+	while (completed < NVMET_MDEV_QUEUE_WORK_BUDGET &&
+	       !nvmet_pci_cq_full(atomic_read(&cq->head),
+				     READ_ONCE(cq->tail), cq->depth)) {
 		struct llist_node *node;
 		struct nvmet_mdev_iod *iod;
+		struct nvme_completion *dst;
 		struct nvme_completion cqe;
+		u16 tail = READ_ONCE(cq->tail);
+		u16 phase = READ_ONCE(cq->phase);
 		u16 status;
 
 		if (!READ_ONCE(cq->pending_completions)) {
@@ -825,31 +811,24 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 		nvmet_pci_prepare_cqe(&cqe, le16_to_cpu(cqe.sq_head),
 				      le16_to_cpu(cqe.sq_id), cqe.command_id,
 				      status, phase);
-		posted[completed].iod = iod;
-		posted[completed].dst = (struct nvme_completion *)
-			(cq->entries + tail * sizeof(cqe));
-		posted[completed].status = cqe.status;
-		memcpy(posted[completed].dst, &cqe,
+		dst = (struct nvme_completion *)(cq->entries +
+						tail * sizeof(cqe));
+		memcpy(dst, &cqe,
 		       offsetof(struct nvme_completion, status));
+		/* The phase bit publishes this CQE to a scanning guest. */
+		dma_wmb();
+		WRITE_ONCE(dst->status, cqe.status);
 		nvmet_pci_advance_cq_tail(&tail, &phase, cq->depth);
-		completed++;
-	}
-
-	if (completed) {
-		unsigned int i;
-
-		/* The phase bit publishes each CQE to a scanning guest. */
-		dma_wmb();
-		for (i = 0; i < completed; i++)
-			WRITE_ONCE(posted[i].dst->status, posted[i].status);
-		/* Publish every phase bit before exposing the new host tail. */
-		dma_wmb();
 		WRITE_ONCE(cq->phase, phase);
+		/* Pair with acquire-loads in acknowledgment and notification. */
 		smp_store_release(&cq->tail, tail);
+		completed++;
+		nvmet_mdev_put_iod(iod);
+	}
+	if (completed) {
+		/* Make every published phase bit visible before notification. */
+		dma_wmb();
 		nvmet_mdev_stat_add(ctrl, completions, completed);
-		nvmet_mdev_stat_inc(ctrl, cq_batches);
-		for (i = 0; i < completed; i++)
-			nvmet_mdev_put_iod(posted[i].iod);
 	}
 	if (atomic_read(&cq->head) != smp_load_acquire(&cq->tail))
 		nvmet_mdev_notify_cq(cq, completed ? completed : 1, false);

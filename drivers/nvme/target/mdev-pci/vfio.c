@@ -297,8 +297,8 @@ static ssize_t transport_stats_show(struct device *dev,
 		"response_work_runs %llu\nresponse_batches %llu\n"
 		"response_items %llu\niod_cache_hits %llu\niod_cache_misses %llu\n"
 		"sq_work_runs %llu\ncq_work_runs %llu\n"
-		"sq_batches %llu\ncq_batches %llu\npoll_wakeups %llu\n"
-		"poll_sleeps %llu\nfast_doorbell_writes %llu\n"
+		"poll_wakeups %llu\npoll_sleeps %llu\n"
+		"fast_doorbell_writes %llu\n"
 		"cq_head_wakeups %llu\ninterrupt_suppressed %llu\n"
 		"interrupt_resignals %llu\nsq_runner_requeues %llu\n"
 		"cq_publisher_requeues %llu\npin_cache_pages_current %u\n",
@@ -325,8 +325,6 @@ static ssize_t transport_stats_show(struct device *dev,
 		nvmet_mdev_stat_read(ctrl, iod_cache_misses),
 		nvmet_mdev_stat_read(ctrl, sq_work_runs),
 		nvmet_mdev_stat_read(ctrl, cq_work_runs),
-		nvmet_mdev_stat_read(ctrl, sq_batches),
-		nvmet_mdev_stat_read(ctrl, cq_batches),
 		nvmet_mdev_stat_read(ctrl, poll_wakeups),
 		nvmet_mdev_stat_read(ctrl, poll_sleeps),
 		nvmet_mdev_stat_read(ctrl, fast_doorbell_writes),
