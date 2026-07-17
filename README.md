@@ -10,5 +10,12 @@ namespace and backend implementation.
 - [Queue, interrupt, and teardown invariants](CONCURRENCY.md)
 - [Benchmark procedure](tools/testing/nvmet-mdev-pci/BENCHMARK.md)
 
-The backport target is the stable Linux 7.1.y series. Ordinary guest memory is
-supported; SPDK and hugetlbfs are not required.
+The maintained branches are:
+
+- `v7.2-dev`: active development on the upstream Linux 7.2 release-candidate
+  line;
+- `v7.1`: the maintained stable Linux 7.1.y backport;
+- `master`: an unmodified mirror of upstream Linux for future work.
+
+This revision of `v7.1` is based on the stable Linux 7.1.3 release. Ordinary
+guest memory is supported; SPDK and hugetlbfs are not required.

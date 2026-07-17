@@ -5,10 +5,10 @@ nvmet core transport registration and adds symbols consumed by both
 `nvmet-pci-epf` and `nvmet-mdev-pci`, so the nvmet core and the mediated driver
 must come from the same kernel build.
 
-The flake exports:
+The flake exports project-specific package names:
 
-- `packages.x86_64-linux.kernel`: the patched 7.1.y kernel;
-- `legacyPackages.x86_64-linux.kernelPackages`: its package set;
+- `packages.x86_64-linux.linux_nvmet_mdev_pci`: the patched 7.1.y kernel;
+- `legacyPackages.x86_64-linux.linuxPackages_nvmet_mdev_pci`: its package set;
 - `nixosModules.default`: selects that package set and loads
   `nvmet-mdev-pci` during boot.
 
@@ -41,11 +41,11 @@ Remove or comment out the existing `boot.kernelPackages` assignment in
 `hardware-configuration.nix`; the imported module supplies it with
 `lib.mkForce`.
 
-The pinned nixpkgs exposes Linux 7.1.3 as `linuxPackages_latest`. The module
-uses that package as its configuration and toolchain base, then replaces its
-source with this exact repository. The backport branch tracks the official
-stable `linux-7.1.y` branch and currently carries the nvmet mdev work on top of
-Linux 7.1.3.
+The module builds `linux_nvmet_mdev_pci` from this repository and exposes its
+package set as `linuxPackages_nvmet_mdev_pci`. The pinned nixpkgs kernel is used
+only as a configuration/build baseline; it is not the public identity of the
+custom kernel. The `v7.1` branch tracks the official stable `linux-7.1.y`
+branch and currently carries the nvmet mdev patch series on Linux 7.1.3.
 
 ## Build and activate
 

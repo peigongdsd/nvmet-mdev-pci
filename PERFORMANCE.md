@@ -4,9 +4,10 @@
 
 The production path implements PRP collection, request-lifetime VFIO pins,
 transport-owned SG tables, invalidation drains, explicit IOD references,
-parallel I/O submission, SQ/CQ batching, NVMe interrupt coalescing, Doorbell
-Buffer Config, pinned shadow/event arrays, and bounded event-index polling.
-Small requests use inline metadata and the pin cache is bounded per controller.
+parallel I/O submission, lockless SQ/CQ ownership, NVMe interrupt coalescing,
+Doorbell Buffer Config, pinned shadow/event arrays, and bounded event-index
+polling. Small requests use inline metadata and the pin cache is bounded per
+controller.
 
 The latest CPU patch removes the old implementation-choice module switches and
 makes the measured fast paths unconditional. Hot counters are per-CPU, MSI-X is
@@ -17,14 +18,15 @@ request pins run concurrently;
 the DMA-unmap path takes an exclusive admission gate before inspecting active
 payloads. Cache xarray/LRU mutation remains serialized.
 
-The current notification patch removes `ctrl->lock` from aligned 32-bit
-doorbell writes. One SQ runner drains each visible submission burst, completed
-IODs enter a lockless MPSC list, and one CQ publisher detaches FIFO snapshots
-and publishes up to 64 CQEs without waiting for a target batch size. CQ status
-and phase are written last. I/O CQs publish completions immediately but retain
-at most one unacknowledged eventfd notification; a CQ-head update acknowledges
-it, and DBBUF event indices are armed so that acknowledgement traps promptly.
-Explicit NVMe interrupt coalescing remains a separate standard policy.
+The current notification path removes `ctrl->lock` from aligned 32-bit
+doorbell writes. One SQ runner owns the SQ head and submits each copied command
+immediately. Completed IODs enter a lockless MPSC list, and one CQ publisher
+owns the CQ tail and phase while publishing each CQE immediately. Bounded
+draining provides workqueue fairness without waiting for a batch. I/O CQs
+retain at most one unacknowledged eventfd notification; a CQ-head update
+acknowledges it, and DBBUF event indices are armed so that acknowledgement
+traps promptly. Explicit NVMe interrupt coalescing remains a separate standard
+policy.
 
 The trace that motivated this patch covered 7.17 million commands and observed
 6.88 million CQ worker runs, 6.87 million interrupts, and 13.81 million
@@ -104,12 +106,12 @@ kernel, module, QEMU and fio versions.
 
 Instrument commands consumed, payload bytes pinned, completions posted, IRQs
 signalled, MMIO doorbell kicks and shadow-doorbell polls. Cumulative counters
-live in the mdev's `transport_stats` sysfs file and are updated per batch or
-request, not in the per-page or busy-poll loop.
+live in the mdev's `transport_stats` sysfs file and use per-CPU aggregation on
+hot paths rather than per-page or busy-poll instrumentation.
 
 Files:
 
-- `drivers/nvme/target/mdev-pci/priv.h`: batched statistics;
+- `drivers/nvme/target/mdev-pci/priv.h`: per-CPU statistics;
 - `drivers/nvme/target/mdev-pci/vfio.c`: `transport_stats` attribute;
 - `tools/testing/nvmet-mdev-pci`: guest fio and host perf collection.
 
@@ -177,7 +179,7 @@ This patch is a release gate for zero-copy. Performance work must not proceed
 to parallel dispatch until active-unmap stress completes without leaks or
 stalls.
 
-## Series 3: parallel execution and batching
+## Series 3: parallel execution and lockless queue ownership
 
 ### Patch 7: give IODs explicit lifetime references
 
@@ -192,23 +194,23 @@ controller workqueue with concurrency bounded by queue depth and a controller
 limit. Run KASAN, KCSAN and lockdep configurations before enabling it by
 default.
 
-### Patch 8: batch SQ consumption and reduce controller-mutex scope
+### Patch 8: serialize SQ ownership without delaying submission
 
-On one doorbell kick, snapshot a validated tail, copy a bounded batch of SQEs,
-advance the head, and submit them without taking `ctrl->lock` once per command.
-Use `READ_ONCE`/`WRITE_ONCE` and the required DMA barriers for queue indices;
-reserve the mutex for lifecycle changes. Allocate IODs from a slab cache or
-mempool sized to the configured in-flight limit.
+On one doorbell kick, snapshot a validated tail, claim exclusive ownership of
+the SQ head and submit each copied SQE immediately. Bound one invocation for
+workqueue fairness, not aggregation. Use `READ_ONCE`/`WRITE_ONCE` and the
+required DMA barriers for queue indices; reserve the mutex for lifecycle
+changes. Allocate IODs from a slab cache or mempool sized to the configured
+in-flight limit.
 
-### Patch 9: batch CQ publication and completion interrupts
+### Patch 9: publish CQEs through one lockless owner
 
 Completed IODs enter a lockless multi-producer list. A single CQ publisher
 detaches and reverses one snapshot to FIFO order, retains any unposted
-remainder, and publishes up to 64 currently available CQEs without waiting.
-Write CQE status/phase last after a DMA barrier. Publish completions immediately
-while suppressing redundant notifications until CQ-head progress acknowledges
-the outstanding interrupt. Preserve CQ-full retry, phase wrapping, DBBUF event
-arming and explicit NVMe coalescing.
+remainder, and publishes each CQE immediately. Write CQE status/phase last
+after a DMA barrier. Suppress redundant notifications until CQ-head progress
+acknowledges the outstanding interrupt. Preserve CQ-full retry, phase wrapping,
+DBBUF event arming and explicit NVMe coalescing.
 
 Success gate: four-job random I/O scales across host CPUs, KVM exits do not
 increase per I/O, and p99 latency remains bounded at queue depth 32.
@@ -226,7 +228,7 @@ behavior until benchmarks select conservative values.
 Files:
 
 - `mdev-pci/irq.c`: per-vector pending count, timer and signal decision;
-- `mdev-pci/queue.c`: report CQ batch completion;
+- `mdev-pci/queue.c`: report CQ completion progress;
 - `mdev-pci/priv.h`: vector state;
 - `mdev-pci/queue.c`: Feature get/set plumbing.
 
@@ -279,7 +281,7 @@ Submit the work as four reviewable series, not one large change:
 
 1. measurement plus PRP iterator;
 2. payload pinning plus invalidation safety;
-3. IOD lifetime, parallel dispatch and batching;
+3. IOD lifetime, parallel dispatch and lockless queue ownership;
 4. coalescing plus shadow doorbells.
 
 Each series gets a fresh VM correctness run and benchmark report. Stop and fix

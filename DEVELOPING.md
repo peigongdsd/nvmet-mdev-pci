@@ -111,7 +111,8 @@ tools/testing/kunit/kunit.py run \
 5. Allocate an nvmet controller per mdev UUID and implement admin queues.
 6. Implement I/O queues and a bounded copy data path through nvmet.
 7. Harden reset, removal and IOVA invalidation.
-8. Pin payload pages for zero-copy I/O, then add shadow doorbells and batching.
+8. Pin payload pages for zero-copy I/O, then add shadow doorbells and interrupt
+   coalescing.
 
 The normal BAR doorbells will remain trapped so they can wake an idle backend.
 The steady-state fast path will use NVMe shadow doorbells in guest memory.
@@ -158,13 +159,14 @@ and fetches only the entries required by the command.
 errors as a test failure. A rebuilt-kernel rerun remains required to validate
 the regression fix.
 
-The Layer 2 batch replaces I/O payload copies with request-lifetime page
-pinning and adds parallel submission, SQ/CQ batching, interrupt coalescing and
-shadow doorbells. Admin payloads retain the simpler copy path. The optimized
-I/O implementation is now the sole production path; only cache sizing and poll
-budget remain configurable, along with response-worker concurrency for
-large-I/O cleanup. The batch passes focused compilation and KUnit checks but
-requires a rebuilt-kernel VM smoke run before it can be called runtime-complete.
+The Layer 2 work replaces I/O payload copies with request-lifetime page
+pinning and adds parallel submission, lockless SQ/CQ ownership, interrupt
+coalescing and shadow doorbells. Admin payloads retain the simpler copy path.
+The optimized I/O implementation is now the sole production path; only cache
+sizing and poll budget remain configurable, along with response-worker
+concurrency for large-I/O cleanup. The implementation passes focused
+compilation and KUnit checks but requires a rebuilt-kernel VM smoke run before
+it can be called runtime-complete.
 See `PERFORMANCE.md` for the safety invariants, benchmark matrix and acceptance
 gates. See `CONCURRENCY.md` for the lockless ownership model, memory-ordering
 rules, DBBUF acknowledgement behavior and teardown proof.
