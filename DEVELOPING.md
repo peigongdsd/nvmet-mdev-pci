@@ -41,9 +41,14 @@ smallest affected target first:
 
 ```sh
 nix develop path:. --command \
-  make -j"$(nproc)" drivers/nvme/target/
+  make -j"$(nproc)" drivers/nvme/target/nvmet-mdev-pci.o
 nix develop path:. --command ccache --show-stats
 ```
+
+Use the composite object target above for the inner loop. In this out-of-tree
+output setup, the directory target `drivers/nvme/target/` can complete without
+rechecking a changed component object. Verify source/object timestamps if a
+supposed rebuild prints no `CC [M]` line.
 
 Kbuild recompiles only objects whose inputs changed. Ccache also avoids
 recompiling an object after switching revisions and returning to equivalent
@@ -68,12 +73,19 @@ the boot generation. Reboot before testing changes to nvmet core.
 `BLK_DEV_NVME` selects the promptless `NVME_CORE` symbol required by the PCI
 target transports. `NVME_TARGET_MDEV_PCI` similarly selects `VFIO_MDEV`.
 
-Use `LLVM=1` on each `make` invocation to build with Clang. Run sparse against
-changed target code with:
+The current Nix-wrapped Clang is not a verified path: `LLVM=1` fails during
+kernel prepare because the wrapper reports `-nostdlibinc` as unused under
+`-Werror`. Use an unwrapped kernel-compatible Clang toolchain and a separate
+output directory before counting a Clang build as a check.
+
+Run sparse against changed target code with:
 
 ```sh
 make C=2 CHECK="sparse" drivers/nvme/target/
 ```
+
+Sparse 0.6.4 from the current shell cannot parse the kernel checker probe's
+`__typeof_unqual__`; use a newer Sparse before counting this check as passed.
 
 The `nvmet-pci-common` KUnit suite covers queue-full wraparound, SQ/CQ index
 and phase transitions, completion-entry encoding, single-subsystem port
@@ -154,4 +166,5 @@ budget remain configurable, along with response-worker concurrency for
 large-I/O cleanup. The batch passes focused compilation and KUnit checks but
 requires a rebuilt-kernel VM smoke run before it can be called runtime-complete.
 See `PERFORMANCE.md` for the safety invariants, benchmark matrix and acceptance
-gates.
+gates. See `CONCURRENCY.md` for the lockless ownership model, memory-ordering
+rules, DBBUF acknowledgement behavior and teardown proof.

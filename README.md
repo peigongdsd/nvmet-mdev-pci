@@ -7,6 +7,7 @@ namespace and backend implementation.
 - [Usage and VM assignment](USAGE.md)
 - [Development and test status](DEVELOPING.md)
 - [Performance design and acceptance gates](PERFORMANCE.md)
+- [Queue, interrupt, and teardown invariants](CONCURRENCY.md)
 - [Benchmark procedure](tools/testing/nvmet-mdev-pci/BENCHMARK.md)
 
 The current development target is Linux 7.2-rc3. Ordinary guest memory is

@@ -17,6 +17,10 @@
 #define NVMET_MDEV_PRP_ENTRIES		(SZ_4K / sizeof(__le64))
 #define NVMET_MDEV_MAX_SEGS		(NVMET_MDEV_COPY_MAX_DATA / SZ_4K + 1)
 #define NVMET_MDEV_BATCH_SIZE		64
+
+static_assert(offsetof(struct nvme_completion, status) +
+	      sizeof_field(struct nvme_completion, status) ==
+	      sizeof(struct nvme_completion));
 #define NVMET_MDEV_MAX_RESPONSE_WORKERS	64
 #define NVMET_MDEV_POLL_INTERVAL	msecs_to_jiffies(10)
 
@@ -40,6 +44,7 @@ MODULE_PARM_DESC(response_workers,
 struct nvmet_mdev_iod {
 	struct list_head entry;
 	struct llist_node free_node;
+	struct llist_node completion_node;
 	struct nvmet_mdev_ctrl *ctrl;
 	struct nvmet_mdev_sq *sq;
 	struct nvmet_mdev_cq *cq;
@@ -286,41 +291,130 @@ static int nvmet_mdev_copy_payload(struct nvmet_mdev_iod *iod,
 static u32 nvmet_mdev_sq_tail(struct nvmet_mdev_ctrl *ctrl,
 			      const struct nvmet_mdev_sq *sq)
 {
-	if (sq->qid && ctrl->dbbuf_dbs)
-		return le32_to_cpu(READ_ONCE(ctrl->dbbuf_dbs[sq->qid * 2]));
-	return get_unaligned_le32(ctrl->bar0 + NVME_REG_DBS +
-				  sq->qid * 2 * sizeof(u32));
+	__le32 *dbs = smp_load_acquire(&ctrl->dbbuf_dbs);
+
+	if (sq->qid && dbs)
+		return le32_to_cpu(READ_ONCE(dbs[sq->qid * 2]));
+	return le32_to_cpu(READ_ONCE(*(__le32 *)(ctrl->bar0 + NVME_REG_DBS +
+					       sq->qid * 2 * sizeof(u32))));
 }
 
 static u32 nvmet_mdev_cq_head(struct nvmet_mdev_ctrl *ctrl,
 			      const struct nvmet_mdev_cq *cq)
 {
-	if (cq->qid && ctrl->dbbuf_dbs)
-		return le32_to_cpu(READ_ONCE(ctrl->dbbuf_dbs[cq->qid * 2 + 1]));
-	return get_unaligned_le32(ctrl->bar0 + NVME_REG_DBS +
-				  (cq->qid * 2 + 1) * sizeof(u32));
+	__le32 *dbs = smp_load_acquire(&ctrl->dbbuf_dbs);
+
+	if (cq->qid && dbs)
+		return le32_to_cpu(READ_ONCE(dbs[cq->qid * 2 + 1]));
+	return le32_to_cpu(READ_ONCE(*(__le32 *)(ctrl->bar0 + NVME_REG_DBS +
+					       (cq->qid * 2 + 1) *
+					       sizeof(u32))));
 }
 
-static void __nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq);
+static void nvmet_mdev_activate_cq(struct nvmet_mdev_cq *cq);
+static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq,
+				      bool resignal);
+static bool nvmet_mdev_arm_cq_event(struct nvmet_mdev_ctrl *ctrl,
+				    struct nvmet_mdev_cq *cq);
 
-static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq, u32 head)
+static bool nvmet_mdev_cq_has_completions(struct nvmet_mdev_cq *cq)
+{
+	return READ_ONCE(cq->pending_completions) ||
+	       !llist_empty(&cq->completions);
+}
+
+static void nvmet_mdev_notify_cq(struct nvmet_mdev_cq *cq,
+				 unsigned int completions, bool force)
 {
 	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
-	unsigned long flags;
-	bool wake = false;
+	struct nvmet_mdev_irq_vector *irq;
 
-	spin_lock_irqsave(&cq->lock, flags);
-	if (READ_ONCE(cq->live) &&
-	    (head >= cq->depth ||
-	     (cq->blocked && head != READ_ONCE(cq->head)))) {
-		__nvmet_mdev_queue_cq_work(cq);
-		wake = true;
+	if (!READ_ONCE(cq->irq_enabled) || !READ_ONCE(ctrl->enabled) ||
+	    !smp_load_acquire(&cq->live))
+		return;
+	irq = &ctrl->irq_vectors[READ_ONCE(cq->vector)];
+	if (!cq->qid) {
+		nvmet_mdev_notify_irq(ctrl, cq->vector, completions, true);
+		return;
 	}
-	spin_unlock_irqrestore(&cq->lock, flags);
+	/* Preserve explicit NVMe coalescing; it is its own batching policy. */
+	if (!force && READ_ONCE(ctrl->irq_coalesce_time) &&
+	    READ_ONCE(ctrl->irq_coalesce_threshold) &&
+	    !READ_ONCE(irq->coalescing_disabled)) {
+		nvmet_mdev_notify_irq(ctrl, cq->vector, completions, false);
+		return;
+	}
+	for (;;) {
+		if (atomic_cmpxchg(&cq->irq_outstanding, 0, 1)) {
+			nvmet_mdev_stat_inc(ctrl, interrupt_suppressed);
+			return;
+		}
+		/* Arm a trapped acknowledgement before raising the interrupt. */
+		if (!smp_load_acquire(&ctrl->dbbuf_dbs) ||
+		    !nvmet_mdev_arm_cq_event(ctrl, cq))
+			break;
+		nvmet_mdev_handle_cq_head(cq, false);
+		if (atomic_read(&cq->head) == smp_load_acquire(&cq->tail))
+			return;
+	}
+	nvmet_mdev_notify_irq(ctrl, cq->vector, completions, force);
+}
 
+static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq,
+				      bool resignal)
+{
+	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
+	bool changed = false;
+	bool wake = false;
+	u32 head;
+	int old_head;
+
+	if (!smp_load_acquire(&cq->live))
+		return false;
+
+	/* Converge concurrent vCPU callbacks on the newest doorbell value. */
+	for (;;) {
+		head = nvmet_mdev_cq_head(ctrl, cq);
+		if (head >= READ_ONCE(cq->depth))
+			break;
+		old_head = atomic_read(&cq->head);
+		if (head == old_head)
+			break;
+		if (atomic_cmpxchg(&cq->head, old_head, head) != old_head)
+			continue;
+		changed = true;
+	}
+
+	if (cq->qid && changed) {
+		/* atomic_xchg() publishes the ack before checking missed CQEs. */
+		atomic_xchg(&cq->irq_outstanding, 0);
+		if (resignal &&
+		    atomic_read(&cq->head) != smp_load_acquire(&cq->tail)) {
+			nvmet_mdev_stat_inc(ctrl, interrupt_resignals);
+			nvmet_mdev_notify_cq(cq, 1, true);
+		}
+	}
+	if (head >= READ_ONCE(cq->depth)) {
+		nvmet_mdev_activate_cq(cq);
+		wake = true;
+	} else if (changed) {
+		bool was_blocked = atomic_xchg(&cq->blocked, 0);
+
+		if (was_blocked || nvmet_mdev_cq_has_completions(cq)) {
+			nvmet_mdev_activate_cq(cq);
+			wake = true;
+		}
+	}
 	if (wake)
 		nvmet_mdev_stat_inc(ctrl, cq_head_wakeups);
 	return wake;
+}
+
+static void nvmet_mdev_activate_sq(struct nvmet_mdev_sq *sq)
+{
+	atomic_set(&sq->kick_pending, 1);
+	if (atomic_cmpxchg(&sq->runner_active, 0, 1) == 0)
+		schedule_work(&sq->work);
 }
 
 static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
@@ -330,11 +424,13 @@ static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 
 	nvmet_mdev_stat_inc(ctrl, poll_wakeups);
 	nvmet_mdev_stat_inc(ctrl, poll_runs);
-	enabled = READ_ONCE(ctrl->enabled) && READ_ONCE(ctrl->dbbuf_dbs) &&
+	enabled = READ_ONCE(ctrl->enabled) &&
+		  smp_load_acquire(&ctrl->dbbuf_dbs) &&
 		  READ_ONCE(ctrl->dbbuf_eis);
 	if (!enabled)
 		goto unlock;
 
+	rcu_read_lock();
 	if (ctrl->nr_queues <= 1)
 		goto account;
 	qid = ctrl->poll_next_qid;
@@ -346,12 +442,12 @@ static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 
 		if (READ_ONCE(sq->live) && nvmet_mdev_sq_tail(ctrl, sq) !=
 		    READ_ONCE(sq->head))
-			schedule_work(&sq->work);
+			nvmet_mdev_activate_sq(sq);
 		if (READ_ONCE(cq->live)) {
 			u32 head = nvmet_mdev_cq_head(ctrl, cq);
 
-			if (head != READ_ONCE(cq->head))
-				nvmet_mdev_handle_cq_head(cq, head);
+			if (head != atomic_read(&cq->head))
+				nvmet_mdev_handle_cq_head(cq, true);
 		}
 		scanned++;
 		qid++;
@@ -361,6 +457,7 @@ static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 	ctrl->poll_next_qid = qid;
 account:
 	nvmet_mdev_stat_add(ctrl, poll_queue_checks, scanned);
+	rcu_read_unlock();
 unlock:
 	if (enabled) {
 		nvmet_mdev_stat_inc(ctrl, poll_sleeps);
@@ -382,30 +479,37 @@ static void nvmet_mdev_kick_poller(struct nvmet_mdev_ctrl *ctrl)
 {
 	bool enabled;
 
-	enabled = READ_ONCE(ctrl->enabled) && READ_ONCE(ctrl->dbbuf_dbs);
+	enabled = READ_ONCE(ctrl->enabled) &&
+		  smp_load_acquire(&ctrl->dbbuf_dbs);
 	if (!enabled)
 		return;
 	mod_delayed_work(system_wq, &ctrl->poll_work, 0);
 }
 
-static void __nvmet_mdev_queue_cq_work(struct nvmet_mdev_cq *cq)
+static void nvmet_mdev_activate_cq(struct nvmet_mdev_cq *cq)
 {
-	lockdep_assert_held(&cq->lock);
-
-	if (atomic_cmpxchg(&cq->work_queued, 0, 1) == 0)
+	if (atomic_read(&cq->blocked)) {
+		/* A completion cannot unblock a full CQ; retain it for the ack. */
+		atomic_set(&cq->kick_pending, 1);
+		return;
+	}
+	atomic_set(&cq->kick_pending, 1);
+	if (atomic_cmpxchg(&cq->publisher_active, 0, 1) == 0)
 		schedule_work(&cq->work);
 }
 
 static bool nvmet_mdev_arm_sq_event(struct nvmet_mdev_ctrl *ctrl,
 				    struct nvmet_mdev_sq *sq)
 {
+	__le32 *dbs = smp_load_acquire(&ctrl->dbbuf_dbs);
+	__le32 *eis = READ_ONCE(ctrl->dbbuf_eis);
 	u32 tail;
 
 	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(sq->live) || !sq->qid ||
-	    !READ_ONCE(ctrl->dbbuf_dbs) || !READ_ONCE(ctrl->dbbuf_eis))
+	    !dbs || !eis)
 		return false;
-	tail = nvmet_mdev_sq_tail(ctrl, sq);
-	WRITE_ONCE(ctrl->dbbuf_eis[sq->qid * 2], cpu_to_le32(tail));
+	tail = le32_to_cpu(READ_ONCE(dbs[sq->qid * 2]));
+	WRITE_ONCE(eis[sq->qid * 2], cpu_to_le32(tail));
 	/* Pair with the guest's shadow-doorbell write and event-index read. */
 	mb();
 	return nvmet_mdev_sq_tail(ctrl, sq) != tail;
@@ -414,15 +518,17 @@ static bool nvmet_mdev_arm_sq_event(struct nvmet_mdev_ctrl *ctrl,
 static bool nvmet_mdev_arm_cq_event(struct nvmet_mdev_ctrl *ctrl,
 				    struct nvmet_mdev_cq *cq)
 {
+	__le32 *dbs = smp_load_acquire(&ctrl->dbbuf_dbs);
+	__le32 *eis = READ_ONCE(ctrl->dbbuf_eis);
 	u32 head;
 
 	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live) || !cq->qid ||
-	    !READ_ONCE(ctrl->dbbuf_dbs) || !READ_ONCE(ctrl->dbbuf_eis))
+	    !dbs || !eis)
 		return false;
-	head = nvmet_mdev_cq_head(ctrl, cq);
-	if (head != READ_ONCE(cq->head))
+	head = le32_to_cpu(READ_ONCE(dbs[cq->qid * 2 + 1]));
+	if (head != atomic_read(&cq->head))
 		return true;
-	WRITE_ONCE(ctrl->dbbuf_eis[cq->qid * 2 + 1], cpu_to_le32(head));
+	WRITE_ONCE(eis[cq->qid * 2 + 1], cpu_to_le32(head));
 	/* Pair with the guest's shadow-doorbell write and event-index read. */
 	mb();
 	return nvmet_mdev_cq_head(ctrl, cq) != head;
@@ -432,17 +538,13 @@ static void nvmet_mdev_complete_iod(struct nvmet_mdev_iod *iod)
 {
 	struct nvmet_mdev_cq *cq = iod->cq;
 	struct nvmet_mdev_ctrl *ctrl = iod->ctrl;
-	unsigned long flags;
 
-	spin_lock_irqsave(&cq->lock, flags);
-	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live)) {
-		spin_unlock_irqrestore(&cq->lock, flags);
+	if (!READ_ONCE(ctrl->enabled) || !smp_load_acquire(&cq->live)) {
 		nvmet_mdev_put_iod(iod);
 		return;
 	}
-	list_add_tail(&iod->entry, &cq->completions);
-	__nvmet_mdev_queue_cq_work(cq);
-	spin_unlock_irqrestore(&cq->lock, flags);
+	llist_add(&iod->completion_node, &cq->completions);
+	nvmet_mdev_activate_cq(cq);
 }
 
 static void nvmet_mdev_response_iod(struct nvmet_mdev_iod *iod)
@@ -591,7 +693,8 @@ static void nvmet_mdev_sq_work(struct work_struct *work)
 	u32 tail;
 
 	nvmet_mdev_stat_inc(ctrl, sq_work_runs);
-	if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(sq->live))
+	atomic_set(&sq->kick_pending, 0);
+	if (!READ_ONCE(ctrl->enabled) || !smp_load_acquire(&sq->live))
 		goto unlock;
 
 	tail = nvmet_mdev_sq_tail(ctrl, sq);
@@ -644,10 +747,27 @@ unlock:
 			nvmet_mdev_submit_iod(iod);
 		}
 	}
-	if (more && !failed)
+	if (!failed && READ_ONCE(ctrl->enabled) &&
+	    smp_load_acquire(&sq->live) &&
+	    (more || atomic_xchg(&sq->kick_pending, 0) ||
+	     nvmet_mdev_arm_sq_event(ctrl, sq))) {
+		nvmet_mdev_stat_inc(ctrl, sq_runner_requeues);
 		schedule_work(&sq->work);
-	else if (!failed && nvmet_mdev_arm_sq_event(ctrl, sq))
+		return;
+	}
+
+	atomic_set_release(&sq->runner_active, 0);
+	/* Pair runner release with the final kick and tail recheck. */
+	smp_mb();
+	if (!failed && READ_ONCE(ctrl->enabled) &&
+	    smp_load_acquire(&sq->live) &&
+	    (atomic_xchg(&sq->kick_pending, 0) ||
+	     nvmet_mdev_sq_tail(ctrl, sq) != READ_ONCE(sq->head) ||
+	     nvmet_mdev_arm_sq_event(ctrl, sq)) &&
+	    atomic_cmpxchg(&sq->runner_active, 0, 1) == 0) {
+		nvmet_mdev_stat_inc(ctrl, sq_runner_requeues);
 		schedule_work(&sq->work);
+	}
 }
 
 static void nvmet_mdev_cq_work(struct work_struct *work)
@@ -655,100 +775,140 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 	struct nvmet_mdev_cq *cq =
 		container_of(work, struct nvmet_mdev_cq, work);
 	struct nvmet_mdev_ctrl *ctrl = cq->ctrl;
-	unsigned int completed;
-	struct nvmet_mdev_iod *iod, *tmp;
-	unsigned long flags;
-	bool blocked;
+	struct {
+		struct nvmet_mdev_iod *iod;
+		struct nvme_completion *dst;
+		__le16 status;
+	} posted[NVMET_MDEV_BATCH_SIZE];
+	unsigned int completed = 0;
+	u16 tail, phase;
 	u32 head;
+	bool blocked = false;
 
 	nvmet_mdev_stat_inc(ctrl, cq_work_runs);
-again:
-	completed = 0;
-	{
-		LIST_HEAD(done);
+	atomic_set(&cq->kick_pending, 0);
+	if (!READ_ONCE(ctrl->enabled) || !smp_load_acquire(&cq->live))
+		goto out_release;
 
-		if (!READ_ONCE(ctrl->enabled) || !READ_ONCE(cq->live))
-			goto unlock;
+	head = nvmet_mdev_cq_head(ctrl, cq);
+	if (head >= READ_ONCE(cq->depth)) {
+		mutex_lock(&ctrl->lock);
+		WRITE_ONCE(ctrl->enabled, false);
+		nvmet_mdev_pci_set_fatal(ctrl);
+		mutex_unlock(&ctrl->lock);
+		goto out_release;
+	}
+	if (head != atomic_read(&cq->head))
+		nvmet_mdev_handle_cq_head(cq, true);
 
-		head = nvmet_mdev_cq_head(ctrl, cq);
-		if (head >= cq->depth) {
-			mutex_lock(&ctrl->lock);
-			WRITE_ONCE(ctrl->enabled, false);
-			nvmet_mdev_pci_set_fatal(ctrl);
-			mutex_unlock(&ctrl->lock);
-			goto unlock;
+	tail = READ_ONCE(cq->tail);
+	phase = READ_ONCE(cq->phase);
+	while (completed < NVMET_MDEV_BATCH_SIZE &&
+	       !nvmet_pci_cq_full(atomic_read(&cq->head), tail, cq->depth)) {
+		struct llist_node *node;
+		struct nvmet_mdev_iod *iod;
+		struct nvme_completion cqe;
+		u16 status;
+
+		if (!READ_ONCE(cq->pending_completions)) {
+			node = llist_del_all(&cq->completions);
+			if (!node)
+				break;
+			WRITE_ONCE(cq->pending_completions,
+				   llist_reverse_order(node));
 		}
-		WRITE_ONCE(cq->head, head);
+		node = READ_ONCE(cq->pending_completions);
+		WRITE_ONCE(cq->pending_completions, node->next);
+		iod = llist_entry(node, struct nvmet_mdev_iod, completion_node);
+		cqe = iod->cqe;
+		status = le16_to_cpu(cqe.status) >> 1;
+		nvmet_pci_prepare_cqe(&cqe, le16_to_cpu(cqe.sq_head),
+				      le16_to_cpu(cqe.sq_id), cqe.command_id,
+				      status, phase);
+		posted[completed].iod = iod;
+		posted[completed].dst = (struct nvme_completion *)
+			(cq->entries + tail * sizeof(cqe));
+		posted[completed].status = cqe.status;
+		memcpy(posted[completed].dst, &cqe,
+		       offsetof(struct nvme_completion, status));
+		nvmet_pci_advance_cq_tail(&tail, &phase, cq->depth);
+		completed++;
+	}
 
-		spin_lock_irqsave(&cq->lock, flags);
-		while (!list_empty(&cq->completions) &&
-		       !nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
-			struct nvme_completion cqe;
-			u16 status;
+	if (completed) {
+		unsigned int i;
 
-			iod = list_first_entry(&cq->completions,
-					       struct nvmet_mdev_iod, entry);
-			list_del_init(&iod->entry);
-
-			cqe = iod->cqe;
-			status = le16_to_cpu(cqe.status) >> 1;
-			nvmet_pci_prepare_cqe(&cqe, le16_to_cpu(cqe.sq_head),
-					      le16_to_cpu(cqe.sq_id), cqe.command_id,
-					      status, cq->phase);
-			memcpy(cq->entries + cq->tail * sizeof(cqe), &cqe,
-			       sizeof(cqe));
-			nvmet_pci_advance_cq_tail(&cq->tail, &cq->phase,
-						  cq->depth);
-			list_add_tail(&iod->entry, &done);
-			completed++;
-		}
-		spin_unlock_irqrestore(&cq->lock, flags);
-		if (completed)
-			dma_wmb();
+		/* The phase bit publishes each CQE to a scanning guest. */
+		dma_wmb();
+		for (i = 0; i < completed; i++)
+			WRITE_ONCE(posted[i].dst->status, posted[i].status);
+		/* Publish every phase bit before exposing the new host tail. */
+		dma_wmb();
+		WRITE_ONCE(cq->phase, phase);
+		smp_store_release(&cq->tail, tail);
 		nvmet_mdev_stat_add(ctrl, completions, completed);
-		if (completed)
-			nvmet_mdev_stat_inc(ctrl, cq_batches);
+		nvmet_mdev_stat_inc(ctrl, cq_batches);
+		for (i = 0; i < completed; i++)
+			nvmet_mdev_put_iod(posted[i].iod);
+	}
+	if (atomic_read(&cq->head) != smp_load_acquire(&cq->tail))
+		nvmet_mdev_notify_cq(cq, completed ? completed : 1, false);
 
-unlock:
-		list_for_each_entry_safe(iod, tmp, &done, entry) {
-			list_del_init(&iod->entry);
-			nvmet_mdev_put_iod(iod);
+	blocked = nvmet_mdev_cq_has_completions(cq) &&
+		nvmet_pci_cq_full(atomic_read(&cq->head), READ_ONCE(cq->tail),
+				      READ_ONCE(cq->depth));
+	if (blocked) {
+		atomic_set(&cq->blocked, 1);
+		/* Catch a CQ-head advance that raced publication of blocked. */
+		smp_mb();
+		if (!nvmet_pci_cq_full(atomic_read(&cq->head),
+					READ_ONCE(cq->tail),
+					READ_ONCE(cq->depth))) {
+			atomic_set(&cq->blocked, 0);
+			blocked = false;
 		}
 	}
-
-	if (completed && cq->irq_enabled)
-		nvmet_mdev_notify_irq(ctrl, cq->vector, completed, !cq->qid);
-	spin_lock_irqsave(&cq->lock, flags);
-	blocked = READ_ONCE(ctrl->enabled) && READ_ONCE(cq->live) &&
-		  !list_empty(&cq->completions) &&
-		  nvmet_pci_cq_full(cq->head, cq->tail, cq->depth);
-	if (READ_ONCE(ctrl->enabled) && READ_ONCE(cq->live) &&
-	    !list_empty(&cq->completions) &&
-	    !nvmet_pci_cq_full(cq->head, cq->tail, cq->depth)) {
-		spin_unlock_irqrestore(&cq->lock, flags);
-		goto again;
+	if (!blocked && READ_ONCE(ctrl->enabled) &&
+	    smp_load_acquire(&cq->live) &&
+	    nvmet_mdev_cq_has_completions(cq)) {
+		nvmet_mdev_stat_inc(ctrl, cq_publisher_requeues);
+		schedule_work(&cq->work);
+		return;
 	}
-	cq->blocked = blocked;
-	atomic_set(&cq->work_queued, 0);
-	spin_unlock_irqrestore(&cq->lock, flags);
-	if (blocked) {
+
+out_release:
+	atomic_set_release(&cq->publisher_active, 0);
+	/* Pair publisher release with the final kick and queue recheck. */
+	smp_mb();
+	if (!atomic_read(&cq->blocked) && READ_ONCE(ctrl->enabled) &&
+	    smp_load_acquire(&cq->live) &&
+	    (atomic_xchg(&cq->kick_pending, 0) ||
+	     (nvmet_mdev_cq_has_completions(cq) &&
+	      !nvmet_pci_cq_full(atomic_read(&cq->head),
+				    READ_ONCE(cq->tail),
+				    READ_ONCE(cq->depth)))) &&
+	    atomic_cmpxchg(&cq->publisher_active, 0, 1) == 0) {
+		nvmet_mdev_stat_inc(ctrl, cq_publisher_requeues);
+		schedule_work(&cq->work);
+		return;
+	}
+	if (atomic_read(&cq->blocked)) {
 		bool advanced;
 
 		/*
 		 * A head write before blocked was published is caught here. A
-		 * later write observes blocked under cq->lock and queues the worker.
+		 * later write clears blocked atomically and queues the publisher.
 		 */
-		if (READ_ONCE(ctrl->dbbuf_dbs)) {
+		if (smp_load_acquire(&ctrl->dbbuf_dbs)) {
 			advanced = nvmet_mdev_arm_cq_event(ctrl, cq);
 		} else {
 			/* Publish blocked before checking for a racing head update. */
 			smp_mb();
 			advanced = nvmet_mdev_cq_head(ctrl, cq) !=
-				   READ_ONCE(cq->head);
+				   atomic_read(&cq->head);
 		}
 		if (advanced)
-			nvmet_mdev_handle_cq_head(cq,
-				nvmet_mdev_cq_head(ctrl, cq));
+			nvmet_mdev_handle_cq_head(cq, true);
 	}
 }
 
@@ -779,16 +939,21 @@ void nvmet_mdev_queue_response(struct nvmet_req *req)
 
 static void nvmet_mdev_drain_completions(struct nvmet_mdev_cq *cq)
 {
-	struct nvmet_mdev_iod *iod, *tmp;
-	unsigned long flags;
-	LIST_HEAD(completions);
+	struct llist_node *node, *next;
 
-	spin_lock_irqsave(&cq->lock, flags);
-	list_splice_init(&cq->completions, &completions);
-	spin_unlock_irqrestore(&cq->lock, flags);
+	node = READ_ONCE(cq->pending_completions);
+	WRITE_ONCE(cq->pending_completions, NULL);
+	llist_for_each_safe(node, next, node) {
+		struct nvmet_mdev_iod *iod =
+			llist_entry(node, struct nvmet_mdev_iod, completion_node);
 
-	list_for_each_entry_safe(iod, tmp, &completions, entry) {
-		list_del_init(&iod->entry);
+		nvmet_mdev_put_iod(iod);
+	}
+	node = llist_del_all(&cq->completions);
+	llist_for_each_safe(node, next, node) {
+		struct nvmet_mdev_iod *iod =
+			llist_entry(node, struct nvmet_mdev_iod, completion_node);
+
 		nvmet_mdev_put_iod(iod);
 	}
 }
@@ -835,12 +1000,16 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		sq->ctrl = ctrl;
 		sq->qid = qid;
 		INIT_WORK(&sq->work, nvmet_mdev_sq_work);
+		atomic_set(&sq->runner_active, 0);
+		atomic_set(&sq->kick_pending, 0);
 		cq->ctrl = ctrl;
 		cq->qid = qid;
-		spin_lock_init(&cq->lock);
-		INIT_LIST_HEAD(&cq->completions);
-		atomic_set(&cq->work_queued, 0);
-		cq->blocked = false;
+		init_llist_head(&cq->completions);
+		cq->pending_completions = NULL;
+		atomic_set(&cq->publisher_active, 0);
+		atomic_set(&cq->kick_pending, 0);
+		atomic_set(&cq->irq_outstanding, 0);
+		atomic_set(&cq->blocked, 0);
 		INIT_WORK(&cq->work, nvmet_mdev_cq_work);
 	}
 
@@ -867,7 +1036,6 @@ static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 				       u16 vector)
 {
 	struct nvmet_mdev_cq *cq;
-	unsigned long irqflags;
 	size_t size;
 	u16 status;
 	int ret;
@@ -899,7 +1067,7 @@ static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 	}
 	cq->entries = nvmet_mdev_mapping_addr(cq->mapping);
 	cq->depth = depth;
-	cq->head = 0;
+	atomic_set(&cq->head, 0);
 	cq->tail = 0;
 	cq->phase = 1;
 	cq->vector = vector;
@@ -915,11 +1083,13 @@ static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 		cq->depth = 0;
 		goto out_unlock;
 	}
-	spin_lock_irqsave(&cq->lock, irqflags);
-	cq->blocked = false;
-	atomic_set(&cq->work_queued, 0);
-	cq->live = true;
-	spin_unlock_irqrestore(&cq->lock, irqflags);
+	init_llist_head(&cq->completions);
+	cq->pending_completions = NULL;
+	atomic_set(&cq->blocked, 0);
+	atomic_set(&cq->publisher_active, 0);
+	atomic_set(&cq->kick_pending, 0);
+	atomic_set(&cq->irq_outstanding, 0);
+	smp_store_release(&cq->live, true);
 
 out_unlock:
 	mutex_unlock(&ctrl->lock);
@@ -994,6 +1164,8 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 	sq->iod_wq = iod_wq;
 	sq->response_lanes = response_lanes;
 	sq->nr_response_lanes = nr_response_lanes;
+	atomic_set(&sq->runner_active, 0);
+	atomic_set(&sq->kick_pending, 0);
 	put_unaligned_le32(0, ctrl->bar0 + NVME_REG_DBS +
 			   (qid * 2 * sizeof(u32)));
 
@@ -1010,7 +1182,7 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 		sq->nr_response_lanes = 0;
 		goto out_destroy_wq;
 	}
-	sq->live = true;
+	smp_store_release(&sq->live, true);
 	mutex_unlock(&ctrl->lock);
 	return NVME_SC_SUCCESS;
 
@@ -1037,12 +1209,15 @@ static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 		mutex_unlock(&ctrl->lock);
 		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
 	}
-	sq->live = false;
+	smp_store_release(&sq->live, false);
 	iod_wq = sq->iod_wq;
 	response_lanes = sq->response_lanes;
 	mutex_unlock(&ctrl->lock);
 
+	synchronize_rcu();
 	cancel_work_sync(&sq->work);
+	atomic_set(&sq->runner_active, 0);
+	atomic_set(&sq->kick_pending, 0);
 	flush_workqueue(iod_wq);
 	nvmet_sq_destroy(&sq->nvme_sq);
 	destroy_workqueue(iod_wq);
@@ -1066,7 +1241,6 @@ static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 {
 	struct nvmet_mdev_cq *cq;
-	unsigned long irqflags;
 
 	lockdep_assert_held(&ctrl->state_lock);
 	if (qid >= ctrl->nr_queues)
@@ -1078,14 +1252,15 @@ static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 		mutex_unlock(&ctrl->lock);
 		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
 	}
-	spin_lock_irqsave(&cq->lock, irqflags);
-	cq->live = false;
-	cq->blocked = false;
-	spin_unlock_irqrestore(&cq->lock, irqflags);
+	smp_store_release(&cq->live, false);
+	atomic_set(&cq->blocked, 0);
 	mutex_unlock(&ctrl->lock);
 
+	synchronize_rcu();
 	cancel_work_sync(&cq->work);
-	atomic_set(&cq->work_queued, 0);
+	atomic_set(&cq->publisher_active, 0);
+	atomic_set(&cq->kick_pending, 0);
+	atomic_set(&cq->irq_outstanding, 0);
 	nvmet_mdev_drain_completions(cq);
 	nvmet_cq_put(&cq->nvme_cq);
 
@@ -1095,12 +1270,12 @@ static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 	cq->mapping = NULL;
 	cq->entries = NULL;
 	cq->depth = 0;
-	cq->head = 0;
+	atomic_set(&cq->head, 0);
 	cq->tail = 0;
 	cq->phase = 1;
 	cq->vector = 0;
 	cq->irq_enabled = false;
-	cq->blocked = false;
+	atomic_set(&cq->blocked, 0);
 	mutex_unlock(&ctrl->lock);
 	return NVME_SC_SUCCESS;
 }
@@ -1108,8 +1283,8 @@ static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 static void nvmet_mdev_disable_dbbuf(struct nvmet_mdev_ctrl *ctrl)
 {
 	mutex_lock(&ctrl->lock);
-	ctrl->dbbuf_dbs = NULL;
-	ctrl->dbbuf_eis = NULL;
+	smp_store_release(&ctrl->dbbuf_dbs, NULL);
+	WRITE_ONCE(ctrl->dbbuf_eis, NULL);
 	if (ctrl->dbbuf_dbs_mapping)
 		nvmet_mdev_unmap_guest(ctrl, ctrl->dbbuf_dbs_mapping);
 	if (ctrl->dbbuf_eis_mapping)
@@ -1235,6 +1410,8 @@ void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 	struct llist_node *node;
 
 	nvmet_mdev_disable_ctrl(ctrl, 0);
+	/* Doorbell callbacks hold RCU while dereferencing the queue arrays. */
+	synchronize_rcu();
 	cancel_delayed_work_sync(&ctrl->poll_work);
 	kfree(ctrl->cqs);
 	ctrl->cqs = NULL;
@@ -1258,18 +1435,19 @@ void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 				  bool cq)
 {
 	nvmet_mdev_stat_inc(ctrl, doorbell_kicks);
+	rcu_read_lock();
 	if (!READ_ONCE(ctrl->enabled) || qid >= ctrl->nr_queues)
 		goto out;
 	if (cq) {
 		struct nvmet_mdev_cq *mcq = &ctrl->cqs[qid];
-		u32 head = nvmet_mdev_cq_head(ctrl, mcq);
 
-		nvmet_mdev_handle_cq_head(mcq, head);
-	} else if (READ_ONCE(ctrl->sqs[qid].live)) {
-		schedule_work(&ctrl->sqs[qid].work);
+		nvmet_mdev_handle_cq_head(mcq, true);
+	} else if (smp_load_acquire(&ctrl->sqs[qid].live)) {
+		nvmet_mdev_activate_sq(&ctrl->sqs[qid]);
 	}
 out:
 	nvmet_mdev_kick_poller(ctrl);
+	rcu_read_unlock();
 }
 
 u8 nvmet_mdev_get_mdts(const struct nvmet_ctrl *tctrl)
@@ -1452,8 +1630,10 @@ u16 nvmet_mdev_set_dbbuf(struct nvmet_ctrl *tctrl, u64 dbs, u64 eis)
 		goto map_error;
 	}
 
-	ctrl->dbbuf_dbs = nvmet_mdev_mapping_addr(ctrl->dbbuf_dbs_mapping);
-	ctrl->dbbuf_eis = nvmet_mdev_mapping_addr(ctrl->dbbuf_eis_mapping);
+	WRITE_ONCE(ctrl->dbbuf_eis,
+		   nvmet_mdev_mapping_addr(ctrl->dbbuf_eis_mapping));
+	smp_store_release(&ctrl->dbbuf_dbs,
+			  nvmet_mdev_mapping_addr(ctrl->dbbuf_dbs_mapping));
 	mutex_unlock(&ctrl->lock);
 	mod_delayed_work(system_wq, &ctrl->poll_work, 0);
 	return NVME_SC_SUCCESS;

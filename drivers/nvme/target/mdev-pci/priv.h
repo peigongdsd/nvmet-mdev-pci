@@ -17,6 +17,7 @@
 #include <linux/refcount.h>
 #include <linux/rwsem.h>
 #include <linux/scatterlist.h>
+#include <linux/seqlock.h>
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/vfio.h>
@@ -141,6 +142,10 @@ struct nvmet_mdev_stats {
 	local64_t poll_sleeps;
 	local64_t fast_doorbell_writes;
 	local64_t cq_head_wakeups;
+	local64_t interrupt_suppressed;
+	local64_t interrupt_resignals;
+	local64_t sq_runner_requeues;
+	local64_t cq_publisher_requeues;
 };
 
 #define nvmet_mdev_stat_add(ctrl, member, value) do { \
@@ -201,6 +206,9 @@ struct nvmet_mdev_sq {
 	u16 qid;
 	u16 depth;
 	u16 head;
+	/* runner_active owns SQ head; kick_pending closes its release race. */
+	atomic_t runner_active;
+	atomic_t kick_pending;
 	bool live;
 };
 
@@ -209,16 +217,20 @@ struct nvmet_mdev_cq {
 	struct nvmet_cq nvme_cq;
 	struct nvmet_mdev_mapping *mapping;
 	struct work_struct work;
-	/* Shared with block-completion softirq; always acquire with irqsave. */
-	spinlock_t lock;
-	struct list_head completions;
-	atomic_t work_queued;
-	/* Protected by lock. */
-	bool blocked;
+	struct llist_head completions;
+	/* FIFO snapshot owned exclusively by the CQ publisher. */
+	struct llist_node *pending_completions;
+	/* One publisher owns tail/phase; kick_pending closes its release race. */
+	atomic_t publisher_active;
+	atomic_t kick_pending;
+	/* Cleared by an observed CQ-head acknowledgement. */
+	atomic_t irq_outstanding;
+	/* Set only while pending completions cannot fit in the guest CQ. */
+	atomic_t blocked;
 	u8 *entries;
 	u16 qid;
 	u16 depth;
-	u16 head;
+	atomic_t head;
 	u16 tail;
 	u16 phase;
 	u16 vector;
@@ -235,15 +247,17 @@ struct nvmet_mdev_ctrl {
 	struct mutex state_lock;
 	/* Protects controller lifecycle registers and non-MSI-X PCI state. */
 	struct mutex lock;
-	/* Serializes MSI-X masks, pending bits and eventfd replacement. */
+	/* Serializes MSI-X configuration and eventfd replacement. */
 	spinlock_t irq_state_lock;
+	/* Lets signalers retry concurrent configuration or eventfd changes. */
+	seqcount_t irq_state_seq;
 	/* Excludes VFIO invalidation from request pin admission. */
 	struct rw_semaphore dma_pin_lock;
 	/* Protects active payload metadata, the pin cache and blocked state. */
 	struct mutex dma_lock;
 	u8 *config;
 	u8 *bar0;
-	struct eventfd_ctx *irq_ctx[NVMET_MDEV_PCI_MSIX_VECTORS];
+	struct eventfd_ctx __rcu *irq_ctx[NVMET_MDEV_PCI_MSIX_VECTORS];
 	struct nvmet_mdev_irq_vector irq_vectors[NVMET_MDEV_PCI_MSIX_VECTORS];
 	u8 irq_coalesce_threshold;
 	u8 irq_coalesce_time;
