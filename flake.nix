@@ -41,14 +41,16 @@
         pkgs.linuxPackagesFor
           self.packages.${system}.linux_nvmet_mdev_pci;
 
+      overlays.default = final: _previous: {
+        linux_nvmet_mdev_pci = mkNvmetKernel final;
+        linuxPackages_nvmet_mdev_pci = final.linuxPackagesFor final.linux_nvmet_mdev_pci;
+      };
+
       nixosModules.default =
-        { lib, pkgs, ... }:
-        let
-          linux_nvmet_mdev_pci = mkNvmetKernel pkgs;
-          linuxPackages_nvmet_mdev_pci = pkgs.linuxPackagesFor linux_nvmet_mdev_pci;
-        in
+        { pkgs, ... }:
         {
-          boot.kernelPackages = lib.mkForce linuxPackages_nvmet_mdev_pci;
+          nixpkgs.overlays = [ self.overlays.default ];
+          boot.kernelPackages = pkgs.linuxPackages_nvmet_mdev_pci;
           boot.kernelModules = [ "nvmet-mdev-pci" ];
         };
 
