@@ -8,8 +8,7 @@ an A/B mode.
 
 - Do not delay the first completion. There is no batching timer or minimum
   batch size.
-- Consume and publish all work already visible, up to the fixed 64-entry
-  fairness budget.
+- Consume and publish work already visible, up to a fixed fairness budget.
 - Publish CQEs immediately even when an earlier interrupt is outstanding.
   Suppress only redundant eventfd notifications.
 - Keep the ordinary aligned 32-bit BAR doorbell path free of `ctrl->lock`.
@@ -21,7 +20,9 @@ an A/B mode.
 `runner_active` gives one SQ work item exclusive ownership of `sq->head`.
 Doorbell writers and the DBBUF poller set `kick_pending` before attempting to
 claim the runner. The runner clears the kick at entry, consumes the current
-tail snapshot, and submits up to 64 commands without waiting for another.
+tail snapshot, and submits each command immediately. The work budget prevents
+one continuously busy SQ from monopolizing a workqueue CPU; it is not a target
+batch size.
 
 Before sleeping, the runner releases `runner_active`, executes a full barrier,
 and rechecks the kick, the current tail and the DBBUF event-index handshake.
@@ -34,9 +35,10 @@ execution while its current callback is still running.
 
 Completed IODs enter `cq->completions`, a lockless multi-producer list. The
 single CQ publisher detaches one list snapshot and reverses it once, producing
-a FIFO snapshot without one atomic removal per CQE. If the 64-entry budget or
-guest CQ capacity stops the run, `pending_completions` retains the remainder;
-only the publisher writes this pointer.
+a FIFO stream without one atomic removal per CQE. Each CQE is published as it
+is removed from that stream. If the work budget or guest CQ capacity stops the
+run, `pending_completions` retains the remainder; only the publisher writes
+this pointer.
 
 `publisher_active` gives one work item exclusive ownership of the guest CQ
 tail and phase. `kick_pending` closes the same release/recheck race as on SQs.
@@ -54,12 +56,13 @@ older callback cannot overwrite a newer head value.
 ## CQE visibility
 
 The NVMe phase/status word is the ownership marker observed by the guest. For
-every batch the publisher:
+every CQE the publisher:
 
-1. writes all CQE bytes before `status`;
+1. writes the CQE bytes before `status`;
 2. executes `dma_wmb()`;
-3. writes each final status/phase word with `WRITE_ONCE()`;
-4. executes `dma_wmb()` before updating the host-only tail and notifying.
+3. writes the final status/phase word with `WRITE_ONCE()`;
+4. release-publishes the new host tail;
+5. executes `dma_wmb()` before any interrupt notification.
 
 The compile-time assertion in `queue.c` ensures `status` remains the final CQE
 field. A guest can scan concurrently, but it cannot accept a partially written
@@ -86,7 +89,7 @@ publication, the notifier updates it and retries without recursion.
 
 Admin completions remain immediate. Explicit NVMe interrupt coalescing also
 retains its standard threshold/timer path and bypasses `irq_outstanding`; the
-two batching policies are not stacked.
+two notification policies are not stacked.
 
 ## MSI-X state
 

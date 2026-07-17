@@ -8,9 +8,10 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      mkNvmetKernel = kernelPkgs:
+      mkNvmetKernel =
+        kernelPkgs:
         let
-          base = kernelPkgs.linuxPackages_testing.kernel;
+          base = kernelPkgs.linux_testing;
           version = "7.2-rc3-nvmet-mdev-pci";
         in
         base.override {
@@ -32,20 +33,22 @@
     in
     {
       packages.${system} = rec {
-        kernel = mkNvmetKernel pkgs;
-        default = kernel;
+        linux_nvmet_mdev_pci = mkNvmetKernel pkgs;
+        default = linux_nvmet_mdev_pci;
       };
 
-      legacyPackages.${system}.kernelPackages =
-        pkgs.linuxPackagesFor self.packages.${system}.kernel;
+      legacyPackages.${system}.linuxPackages_nvmet_mdev_pci =
+        pkgs.linuxPackagesFor
+          self.packages.${system}.linux_nvmet_mdev_pci;
 
       nixosModules.default =
         { lib, pkgs, ... }:
         let
-          kernel = mkNvmetKernel pkgs;
+          linux_nvmet_mdev_pci = mkNvmetKernel pkgs;
+          linuxPackages_nvmet_mdev_pci = pkgs.linuxPackagesFor linux_nvmet_mdev_pci;
         in
         {
-          boot.kernelPackages = lib.mkForce (pkgs.linuxPackagesFor kernel);
+          boot.kernelPackages = lib.mkForce linuxPackages_nvmet_mdev_pci;
           boot.kernelModules = [ "nvmet-mdev-pci" ];
         };
 
