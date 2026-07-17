@@ -103,7 +103,7 @@
           echo "  output:  $KBUILD_OUTPUT"
           echo "  ccache:  $CCACHE_DIR"
           echo "  prepare: make defconfig"
-          echo "  target:  make -j$(nproc) drivers/nvme/target/"
+          echo "  target:  make -j$(nproc) drivers/nvme/target/nvmet-mdev-pci.o"
         '';
       };
 

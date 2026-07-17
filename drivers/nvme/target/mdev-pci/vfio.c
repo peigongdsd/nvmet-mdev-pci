@@ -299,7 +299,9 @@ static ssize_t transport_stats_show(struct device *dev,
 		"sq_work_runs %llu\ncq_work_runs %llu\n"
 		"sq_batches %llu\ncq_batches %llu\npoll_wakeups %llu\n"
 		"poll_sleeps %llu\nfast_doorbell_writes %llu\n"
-		"cq_head_wakeups %llu\npin_cache_pages_current %u\n",
+		"cq_head_wakeups %llu\ninterrupt_suppressed %llu\n"
+		"interrupt_resignals %llu\nsq_runner_requeues %llu\n"
+		"cq_publisher_requeues %llu\npin_cache_pages_current %u\n",
 		nvmet_mdev_stat_read(ctrl, commands),
 		nvmet_mdev_stat_read(ctrl, pinned_io_bytes),
 		nvmet_mdev_stat_read(ctrl, completions),
@@ -329,6 +331,10 @@ static ssize_t transport_stats_show(struct device *dev,
 		nvmet_mdev_stat_read(ctrl, poll_sleeps),
 		nvmet_mdev_stat_read(ctrl, fast_doorbell_writes),
 		nvmet_mdev_stat_read(ctrl, cq_head_wakeups),
+		nvmet_mdev_stat_read(ctrl, interrupt_suppressed),
+		nvmet_mdev_stat_read(ctrl, interrupt_resignals),
+		nvmet_mdev_stat_read(ctrl, sq_runner_requeues),
+		nvmet_mdev_stat_read(ctrl, cq_publisher_requeues),
 		READ_ONCE(ctrl->pin_cache_nr_pages));
 }
 static DEVICE_ATTR_RO(transport_stats);

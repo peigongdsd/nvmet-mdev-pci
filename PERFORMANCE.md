@@ -17,6 +17,15 @@ request pins run concurrently;
 the DMA-unmap path takes an exclusive admission gate before inspecting active
 payloads. Cache xarray/LRU mutation remains serialized.
 
+The current notification patch removes `ctrl->lock` from aligned 32-bit
+doorbell writes. One SQ runner drains each visible submission burst, completed
+IODs enter a lockless MPSC list, and one CQ publisher detaches FIFO snapshots
+and publishes up to 64 CQEs without waiting for a target batch size. CQ status
+and phase are written last. I/O CQs publish completions immediately but retain
+at most one unacknowledged eventfd notification; a CQ-head update acknowledges
+it, and DBBUF event indices are armed so that acknowledgement traps promptly.
+Explicit NVMe interrupt coalescing remains a separate standard policy.
+
 The trace that motivated this patch covered 7.17 million commands and observed
 6.88 million CQ worker runs, 6.87 million interrupts, and 13.81 million
 doorbells. The old atomic instrumentation performed at least 141.4 million
@@ -193,11 +202,13 @@ mempool sized to the configured in-flight limit.
 
 ### Patch 9: batch CQ publication and completion interrupts
 
-The CQ worker already drains multiple completions, but scheduling can fragment
-one burst into many worker runs. Use one pending bit per CQ, splice a completion
-batch under the CQ spinlock, publish all available CQEs, issue one `dma_wmb()`,
-and signal at most one interrupt for the batch. Preserve CQ-full retry and phase
-handling.
+Completed IODs enter a lockless multi-producer list. A single CQ publisher
+detaches and reverses one snapshot to FIFO order, retains any unposted
+remainder, and publishes up to 64 currently available CQEs without waiting.
+Write CQE status/phase last after a DMA barrier. Publish completions immediately
+while suppressing redundant notifications until CQ-head progress acknowledges
+the outstanding interrupt. Preserve CQ-full retry, phase wrapping, DBBUF event
+arming and explicit NVMe coalescing.
 
 Success gate: four-job random I/O scales across host CPUs, KVM exits do not
 increase per I/O, and p99 latency remains bounded at queue depth 32.

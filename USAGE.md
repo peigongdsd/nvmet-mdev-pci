@@ -12,7 +12,7 @@ transport:
 ```nix
 {
   inputs.nvmet-mdev-pci = {
-    url = "github:peigongdsd/nvmet-mdev-pci?ref=codex/nvmet-mdev-pci";
+    url = "github:peigongdsd/nvmet-mdev-pci?ref=backport/v7.1";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -186,8 +186,9 @@ cat "$MDEV/transport_stats"
 The counters include heap allocations, pin/unpin calls, cache hits/misses and
 evictions, IOD recycle hits/misses, response worker runs/batches/items, SQ/CQ
 batches, interrupts, doorbell kicks, useful CQ-head wakeups, fast doorbell
-writes, and poll scans. They are cumulative for the mdev lifetime and use
-per-CPU updates on the hot path.
+writes, suppressed/re-signalled interrupts, SQ/CQ owner requeues, and poll
+scans. They are cumulative for the mdev lifetime and use per-CPU updates on the
+hot path.
 
 Useful host checks are:
 

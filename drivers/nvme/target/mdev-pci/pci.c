@@ -117,8 +117,10 @@ void nvmet_mdev_pci_reset(struct nvmet_mdev_ctrl *ctrl)
 	lockdep_assert_held(&ctrl->lock);
 	nvmet_mdev_unmap_all(ctrl);
 	spin_lock_irqsave(&ctrl->irq_state_lock, flags);
+	write_seqcount_begin(&ctrl->irq_state_seq);
 	nvmet_mdev_init_config(ctrl);
 	nvmet_mdev_init_bar0(ctrl);
+	write_seqcount_end(&ctrl->irq_state_seq);
 	spin_unlock_irqrestore(&ctrl->irq_state_lock, flags);
 	if (ctrl->tctrl)
 		nvmet_mdev_pci_bind_ctrl(ctrl);
@@ -201,6 +203,51 @@ static bool nvmet_mdev_write_overlaps(unsigned int offset, size_t count,
 	return offset < reg + reg_size && offset + count > reg;
 }
 
+static void nvmet_mdev_bar0_read_snapshot(struct nvmet_mdev_ctrl *ctrl,
+					  u8 *dst, unsigned int offset,
+					  size_t count)
+{
+	const unsigned int db_end = NVMET_MDEV_PCI_MSIX_TABLE;
+	const unsigned int pba_end = NVMET_MDEV_PCI_MSIX_PBA +
+		NVMET_MDEV_PCI_MSIX_VECTORS / BITS_PER_BYTE;
+	size_t copied = 0;
+
+	while (copied < count) {
+		unsigned int pos = offset + copied;
+		size_t length;
+
+		if (pos >= NVME_REG_DBS && pos < db_end) {
+			unsigned int word_offset = NVME_REG_DBS +
+				round_down(pos - NVME_REG_DBS, sizeof(__le32));
+			__le32 value = READ_ONCE(*(__le32 *)(ctrl->bar0 +
+							 word_offset));
+
+			length = min_t(size_t, count - copied,
+				       sizeof(value) - (pos - word_offset));
+			memcpy(dst + copied, (u8 *)&value + pos - word_offset,
+			       length);
+		} else if (pos >= NVMET_MDEV_PCI_MSIX_PBA && pos < pba_end) {
+			unsigned long value = READ_ONCE(*(unsigned long *)(
+				ctrl->bar0 + NVMET_MDEV_PCI_MSIX_PBA));
+
+			length = min_t(size_t, count - copied, pba_end - pos);
+			memcpy(dst + copied, (u8 *)&value +
+			       pos - NVMET_MDEV_PCI_MSIX_PBA, length);
+		} else {
+			unsigned int next = offset + count;
+
+			if (pos < NVME_REG_DBS)
+				next = min(next, (unsigned int)NVME_REG_DBS);
+			else if (pos >= db_end && pos < NVMET_MDEV_PCI_MSIX_PBA)
+				next = min(next,
+					   (unsigned int)NVMET_MDEV_PCI_MSIX_PBA);
+			length = next - pos;
+			memcpy(dst + copied, ctrl->bar0 + pos, length);
+		}
+		copied += length;
+	}
+}
+
 static bool nvmet_mdev_is_32bit_doorbell(loff_t pos, size_t count,
 					 unsigned int *offset)
 {
@@ -227,13 +274,16 @@ static ssize_t nvmet_mdev_fast_doorbell_write(struct nvmet_mdev_ctrl *ctrl,
 	if (copy_from_user(&value, buf, sizeof(value)))
 		return -EFAULT;
 
-	mutex_lock(&ctrl->lock);
-	WRITE_ONCE(*(__le32 *)(ctrl->bar0 + offset), value);
-	mutex_unlock(&ctrl->lock);
-
 	*ppos += sizeof(value);
 	nvmet_mdev_stat_inc(ctrl, fast_doorbell_writes);
-	nvmet_mdev_schedule_doorbell(ctrl, db / 2, db & 1);
+	/* Reset waits for this RCU section before reinitializing BAR0. */
+	rcu_read_lock();
+	if (READ_ONCE(ctrl->enabled)) {
+		/* Doorbells are independent aligned words on the live I/O path. */
+		WRITE_ONCE(*(__le32 *)(ctrl->bar0 + offset), value);
+		nvmet_mdev_schedule_doorbell(ctrl, db / 2, db & 1);
+	}
+	rcu_read_unlock();
 	return sizeof(value);
 }
 
@@ -265,14 +315,23 @@ static int nvmet_mdev_region(struct nvmet_mdev_ctrl *ctrl, loff_t pos,
 ssize_t nvmet_mdev_pci_read(struct nvmet_mdev_ctrl *ctrl, char __user *buf,
 			    size_t count, loff_t *ppos)
 {
-	unsigned long flags;
+	__le32 doorbell;
 	unsigned int offset;
 	size_t region_size;
 	u8 *snapshot = NULL;
+	bool atomic_overlap;
 	bool pba_overlap;
 	u8 *source;
 	u8 *region;
 	int ret;
+
+	if (nvmet_mdev_is_32bit_doorbell(*ppos, count, &offset)) {
+		doorbell = READ_ONCE(*(__le32 *)(ctrl->bar0 + offset));
+		if (copy_to_user(buf, &doorbell, sizeof(doorbell)))
+			return -EFAULT;
+		*ppos += sizeof(doorbell);
+		return sizeof(doorbell);
+	}
 
 	mutex_lock(&ctrl->lock);
 	ret = nvmet_mdev_region(ctrl, *ppos, &region, &region_size, &offset);
@@ -285,15 +344,17 @@ ssize_t nvmet_mdev_pci_read(struct nvmet_mdev_ctrl *ctrl, char __user *buf,
 						NVMET_MDEV_PCI_MSIX_PBA,
 						NVMET_MDEV_PCI_MSIX_VECTORS /
 						BITS_PER_BYTE);
-	if (ret == VFIO_PCI_BAR0_REGION_INDEX && pba_overlap) {
+	atomic_overlap = ret == VFIO_PCI_BAR0_REGION_INDEX &&
+		(nvmet_mdev_write_overlaps(offset, count, NVME_REG_DBS,
+					   NVMET_MDEV_PCI_MSIX_TABLE -
+					   NVME_REG_DBS) || pba_overlap);
+	if (atomic_overlap) {
 		snapshot = kmalloc(count, GFP_KERNEL);
 		if (!snapshot) {
 			ret = -ENOMEM;
 			goto out_unlock;
 		}
-		spin_lock_irqsave(&ctrl->irq_state_lock, flags);
-		memcpy(snapshot, source, count);
-		spin_unlock_irqrestore(&ctrl->irq_state_lock, flags);
+		nvmet_mdev_bar0_read_snapshot(ctrl, snapshot, offset, count);
 		source = snapshot;
 	}
 	if (copy_to_user(buf, source, count)) {
@@ -347,7 +408,11 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 							PCI_MSIX_FLAGS, sizeof(u16));
 		if (update_irqs)
 			spin_lock(&ctrl->irq_state_lock);
+		if (update_irqs)
+			write_seqcount_begin(&ctrl->irq_state_seq);
 		nvmet_mdev_config_write(ctrl, offset, data, count);
+		if (update_irqs)
+			write_seqcount_end(&ctrl->irq_state_seq);
 		if (update_irqs)
 			spin_unlock(&ctrl->irq_state_lock);
 	} else {
@@ -359,7 +424,11 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 							PCI_MSIX_ENTRY_SIZE);
 		if (update_irqs)
 			spin_lock(&ctrl->irq_state_lock);
+		if (update_irqs)
+			write_seqcount_begin(&ctrl->irq_state_seq);
 		nvmet_mdev_bar0_write(ctrl, offset, data, count);
+		if (update_irqs)
+			write_seqcount_end(&ctrl->irq_state_seq);
 		if (update_irqs)
 			spin_unlock(&ctrl->irq_state_lock);
 		new_cc = get_unaligned_le32(ctrl->bar0 + NVME_REG_CC);
