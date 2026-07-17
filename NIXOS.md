@@ -9,6 +9,7 @@ The flake exports project-specific package names:
 
 - `packages.x86_64-linux.linux_nvmet_mdev_pci`: the patched 7.1.y kernel;
 - `legacyPackages.x86_64-linux.linuxPackages_nvmet_mdev_pci`: its package set;
+- `overlays.default`: adds both project-specific attributes to nixpkgs;
 - `nixosModules.default`: selects that package set and loads
   `nvmet-mdev-pci` during boot.
 
@@ -37,15 +38,18 @@ outputs = { self, nixpkgs, nvmet-mdev-pci, ... }@attrs: {
 };
 ```
 
-Remove or comment out the existing `boot.kernelPackages` assignment in
-`hardware-configuration.nix`; the imported module supplies it with
-`lib.mkForce`.
+Remove an unrelated existing `boot.kernelPackages` assignment unless the
+machine configuration intentionally overrides this module's default. A local
+override may extend `pkgs.linuxPackages_nvmet_mdev_pci` and select the result
+with `lib.mkForce`.
 
 The module builds `linux_nvmet_mdev_pci` from this repository and exposes its
-package set as `linuxPackages_nvmet_mdev_pci`. The pinned nixpkgs kernel is used
-only as a configuration/build baseline; it is not the public identity of the
-custom kernel. The `v7.1` branch tracks the official stable `linux-7.1.y`
-branch and currently carries the nvmet mdev patch series on Linux 7.1.3.
+package set as `pkgs.linuxPackages_nvmet_mdev_pci` through the exported overlay.
+Additional system overlays may extend that package set, for example to select a
+ccache stdenv. The pinned nixpkgs kernel is used only as a configuration/build
+baseline; it is not the public identity of the custom kernel. The `v7.1` branch
+tracks the official stable `linux-7.1.y` branch and currently carries the nvmet
+mdev patch series on Linux 7.1.3.
 
 ## Build and activate
 
