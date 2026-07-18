@@ -55,9 +55,11 @@ Compare `response_workers=1` against `0` for serialized versus automatically
 parallel cleanup. Explicit values above one select that many lanes, capped by
 the SQ depth and 64.
 `irq_coalesce_threshold` and `irq_coalesce_time` are raw NVMe Feature 08
-values: threshold 7 means eight completions and time 1 means 100 us. They set
-the defaults for newly created controllers. The guest can change the live
-values with Set Features; controller reset restores the snapshotted defaults.
+values: threshold 7 selects a count trigger of eight completions and time 1
+selects a 100 us bound. The first condition reached raises the interrupt, so
+timer expiry may report fewer than eight completions. These parameters set the
+defaults for newly created controllers. The guest can change the live values
+with Set Features; controller reset restores the snapshotted defaults.
 Use identical guest images, namespace sizes, fio versions, CPU affinity, and
 cache warmup for all runs. Cache hit rate must be reported alongside IOPS: a
 small cache and a large uniform-random working set can otherwise make the

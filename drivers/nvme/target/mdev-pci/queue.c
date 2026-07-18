@@ -52,13 +52,13 @@ MODULE_PARM_DESC(poll_budget,
 static uint response_workers = NVMET_MDEV_DEFAULT_RESPONSE_WORKERS;
 module_param_named(response_workers, response_workers, uint, 0644);
 MODULE_PARM_DESC(response_workers,
-		 "Response cleanup workers per I/O SQ (0 selects an automatic count; default: "
+		 "Response cleanup workers per I/O SQ (default: "
 		 __stringify(NVMET_MDEV_DEFAULT_RESPONSE_WORKERS) ")");
 
 static u8 irq_coalesce_threshold = NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR;
 module_param_named(irq_coalesce_threshold, irq_coalesce_threshold, byte, 0644);
 MODULE_PARM_DESC(irq_coalesce_threshold,
-		 "Default NVMe Feature 08 THR (7 means 8 completions; default: "
+		 "Default NVMe Feature 08 THR (default: "
 		 __stringify(NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR) ")");
 
 static u8 irq_coalesce_time = NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME;
