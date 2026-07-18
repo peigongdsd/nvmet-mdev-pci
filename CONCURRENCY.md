@@ -89,7 +89,10 @@ publication, the notifier updates it and retries without recursion.
 
 Admin completions remain immediate. Explicit NVMe interrupt coalescing also
 retains its standard threshold/timer path and bypasses `irq_outstanding`; the
-two notification policies are not stacked.
+two notification policies are not stacked. New controllers default to Feature
+08 `THR=7`, `TIME=1`. Guest Set Features commands change the live values, and
+controller reset restores the configured defaults after pending timers and
+work have been quiesced.
 
 ## MSI-X state
 

@@ -8,6 +8,7 @@
 #include <linux/refcount.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
+#include <linux/stringify.h>
 #include <linux/unaligned.h>
 
 #include "../pci-common.h"
@@ -23,23 +24,48 @@ static_assert(offsetof(struct nvme_completion, status) +
 	      sizeof(struct nvme_completion));
 #define NVMET_MDEV_MAX_RESPONSE_WORKERS	64
 #define NVMET_MDEV_POLL_INTERVAL	msecs_to_jiffies(10)
+#define NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES	65536
+#define NVMET_MDEV_DEFAULT_PIN_CACHE_MAX_SEGS	64
+#define NVMET_MDEV_DEFAULT_POLL_BUDGET		128
+#define NVMET_MDEV_DEFAULT_RESPONSE_WORKERS	0
+#define NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR	7
+#define NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME	1
 
-static uint pin_cache_pages = 65536;
+static uint pin_cache_pages = NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES;
 module_param_named(pin_cache_pages, pin_cache_pages, uint, 0644);
-MODULE_PARM_DESC(pin_cache_pages, "Maximum cached guest pages per controller");
+MODULE_PARM_DESC(pin_cache_pages,
+		 "Maximum cached guest pages per controller (default: "
+		 __stringify(NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES) ")");
 
-static uint pin_cache_max_segs = 64;
+static uint pin_cache_max_segs = NVMET_MDEV_DEFAULT_PIN_CACHE_MAX_SEGS;
 module_param_named(pin_cache_max_segs, pin_cache_max_segs, uint, 0644);
-MODULE_PARM_DESC(pin_cache_max_segs, "Maximum PRP segments admitted to the pin cache");
+MODULE_PARM_DESC(pin_cache_max_segs,
+		 "Maximum PRP segments admitted to the pin cache (default: "
+		 __stringify(NVMET_MDEV_DEFAULT_PIN_CACHE_MAX_SEGS) ")");
 
-static uint poll_budget = 128;
+static uint poll_budget = NVMET_MDEV_DEFAULT_POLL_BUDGET;
 module_param_named(poll_budget, poll_budget, uint, 0644);
-MODULE_PARM_DESC(poll_budget, "Maximum queues examined by one bounded DBBUF poll run");
+MODULE_PARM_DESC(poll_budget,
+		 "Maximum queues examined by one bounded DBBUF poll run (default: "
+		 __stringify(NVMET_MDEV_DEFAULT_POLL_BUDGET) ")");
 
-static uint response_workers;
+static uint response_workers = NVMET_MDEV_DEFAULT_RESPONSE_WORKERS;
 module_param_named(response_workers, response_workers, uint, 0644);
 MODULE_PARM_DESC(response_workers,
-		 "Response cleanup workers per I/O SQ (0 selects an automatic count)");
+		 "Response cleanup workers per I/O SQ (0 selects an automatic count; default: "
+		 __stringify(NVMET_MDEV_DEFAULT_RESPONSE_WORKERS) ")");
+
+static u8 irq_coalesce_threshold = NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR;
+module_param_named(irq_coalesce_threshold, irq_coalesce_threshold, byte, 0644);
+MODULE_PARM_DESC(irq_coalesce_threshold,
+		 "Default NVMe Feature 08 THR (7 means 8 completions; default: "
+		 __stringify(NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR) ")");
+
+static u8 irq_coalesce_time = NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME;
+module_param_named(irq_coalesce_time, irq_coalesce_time, byte, 0644);
+MODULE_PARM_DESC(irq_coalesce_time,
+		 "Default NVMe Feature 08 TIME in 100 us units (default: "
+		 __stringify(NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME) ")");
 
 struct nvmet_mdev_iod {
 	struct list_head entry;
@@ -937,6 +963,17 @@ static void nvmet_mdev_drain_completions(struct nvmet_mdev_cq *cq)
 	}
 }
 
+static void nvmet_mdev_reset_irq_features(struct nvmet_mdev_ctrl *ctrl)
+{
+	unsigned int vector;
+
+	WRITE_ONCE(ctrl->irq_coalesce_threshold,
+		   ctrl->runtime.irq_coalesce_threshold);
+	WRITE_ONCE(ctrl->irq_coalesce_time, ctrl->runtime.irq_coalesce_time);
+	for (vector = 0; vector < NVMET_MDEV_PCI_MSIX_VECTORS; vector++)
+		WRITE_ONCE(ctrl->irq_vectors[vector].coalescing_disabled, false);
+}
+
 int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 {
 	unsigned int qid;
@@ -945,6 +982,10 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	ctrl->runtime.pin_cache_max_segs = READ_ONCE(pin_cache_max_segs);
 	ctrl->runtime.poll_budget = max_t(unsigned int, READ_ONCE(poll_budget), 1);
 	ctrl->runtime.response_workers = READ_ONCE(response_workers);
+	ctrl->runtime.irq_coalesce_threshold =
+		READ_ONCE(irq_coalesce_threshold);
+	ctrl->runtime.irq_coalesce_time = READ_ONCE(irq_coalesce_time);
+	nvmet_mdev_reset_irq_features(ctrl);
 	mutex_init(&ctrl->state_lock);
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);
 	ctrl->poll_next_qid = 1;
@@ -1292,6 +1333,7 @@ static void __nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	/* Queue workers may access shadow doorbells until both queue sets drain. */
 	nvmet_mdev_disable_dbbuf(ctrl);
 	nvmet_mdev_irq_quiesce(ctrl);
+	nvmet_mdev_reset_irq_features(ctrl);
 
 	if (!ctrl->tctrl)
 		return;

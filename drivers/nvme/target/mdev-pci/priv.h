@@ -110,6 +110,8 @@ struct nvmet_mdev_runtime_config {
 	unsigned int pin_cache_max_segs;
 	unsigned int poll_budget;
 	unsigned int response_workers;
+	u8 irq_coalesce_threshold;
+	u8 irq_coalesce_time;
 };
 
 struct nvmet_mdev_stats {

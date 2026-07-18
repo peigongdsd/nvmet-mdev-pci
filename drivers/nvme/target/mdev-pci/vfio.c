@@ -349,9 +349,12 @@ static ssize_t runtime_config_show(struct device *dev,
 	return sysfs_emit(buf,
 		"pin_cache_pages %u\n"
 		"pin_cache_max_segs %u\npoll_budget %u\n"
-		"response_workers %u\n",
+		"response_workers %u\n"
+		"irq_coalesce_threshold %u\n"
+		"irq_coalesce_time %u\n",
 		cfg->pin_cache_pages, cfg->pin_cache_max_segs,
-		cfg->poll_budget, cfg->response_workers);
+		cfg->poll_budget, cfg->response_workers,
+		cfg->irq_coalesce_threshold, cfg->irq_coalesce_time);
 }
 static DEVICE_ATTR_RO(runtime_config);
 
