@@ -45,8 +45,8 @@ gain.
 
 ## Runtime policy
 
-Only sizing and polling policy are module parameters. Their values are
-snapshotted when an mdev controller is created:
+Sizing, polling and default interrupt-coalescing policy are module parameters.
+Their values are snapshotted when an mdev controller is created:
 
 | Parameter | Default | Policy |
 | --- | ---: | --- |
@@ -54,6 +54,8 @@ snapshotted when an mdev controller is created:
 | `pin_cache_max_segs` | 64 | Maximum PRP segments admitted to the persistent pin cache. |
 | `poll_budget` | 128 | Maximum queue pairs examined by one safety poll. |
 | `response_workers` | 0 | Response cleanup workers per I/O SQ; 0 is automatic and 1 forces serialization. |
+| `irq_coalesce_threshold` | 7 | Default NVMe Feature 08 THR value; 7 means 8 completions. |
+| `irq_coalesce_time` | 1 | Default NVMe Feature 08 TIME value in 100 us units. |
 
 Setting either cache limit to zero disables persistent cache entries but keeps
 request-lifetime pinned I/O. The default cache holds 256 MiB with 4 KiB pages
@@ -61,6 +63,13 @@ and covers common 128 KiB requests, including an unaligned first PRP.
 Automatic response-worker sizing is capped by SQ depth, online CPUs, and a
 maximum of 64. Explicit values are capped by SQ depth and 64. The admin SQ
 remains ordered with one worker.
+
+The interrupt defaults aggregate up to eight completions per MSI-X vector with
+a 100 us bound. CQEs are still published immediately. A guest can replace the
+current values with the standard Set Features command, including setting them
+to zero for immediate interrupts. A controller reset restores the module
+defaults and clears Feature 09 per-vector coalescing-disable state. Admin
+completions remain immediate.
 
 `poll_runs` counts poll function iterations and `poll_queue_checks` counts
 queue-pair loop iterations. `pinned_io_bytes` includes cache hits; actual pin
@@ -222,8 +231,8 @@ increase per I/O, and p99 latency remains bounded at queue depth 32.
 Store the NVMe interrupt coalescing threshold/time and per-vector disable bit
 instead of accepting and ignoring them. Count completions per vector and use a
 high-resolution timer only when a threshold is not reached. Admin completions
-and fatal events remain immediate. Keep defaults equivalent to the current
-behavior until benchmarks select conservative values.
+and fatal events remain immediate. Default to Feature 08 `THR=7`, `TIME=1`,
+which the guest can replace through the standard Set Features command.
 
 Files:
 

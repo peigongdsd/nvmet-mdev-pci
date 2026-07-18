@@ -42,6 +42,8 @@ echo 32768 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pin_cache_pages
 echo 32 | sudo tee /sys/module/nvmet_mdev_pci/parameters/pin_cache_max_segs
 echo 64 | sudo tee /sys/module/nvmet_mdev_pci/parameters/poll_budget
 echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/response_workers
+echo 7 | sudo tee /sys/module/nvmet_mdev_pci/parameters/irq_coalesce_threshold
+echo 1 | sudo tee /sys/module/nvmet_mdev_pci/parameters/irq_coalesce_time
 ```
 
 The default pin cache is 65536 pages and admits up to 64 PRP segments per
@@ -52,6 +54,10 @@ alongside the existing queue and pin counters.
 Compare `response_workers=1` against `0` for serialized versus automatically
 parallel cleanup. Explicit values above one select that many lanes, capped by
 the SQ depth and 64.
+`irq_coalesce_threshold` and `irq_coalesce_time` are raw NVMe Feature 08
+values: threshold 7 means eight completions and time 1 means 100 us. They set
+the defaults for newly created controllers. The guest can change the live
+values with Set Features; controller reset restores the snapshotted defaults.
 Use identical guest images, namespace sizes, fio versions, CPU affinity, and
 cache warmup for all runs. Cache hit rate must be reported alongside IOPS: a
 small cache and a large uniform-random working set can otherwise make the
