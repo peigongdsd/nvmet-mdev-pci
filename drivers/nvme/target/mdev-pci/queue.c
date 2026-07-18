@@ -2,11 +2,13 @@
 
 #include <linux/iommu.h>
 #include <linux/cpu.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
 #include <linux/scatterlist.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/stringify.h>
 #include <linux/unaligned.h>
@@ -24,13 +26,15 @@ static_assert(offsetof(struct nvme_completion, status) +
 	      sizeof(struct nvme_completion));
 #define NVMET_MDEV_MAX_RESPONSE_WORKERS	64
 #define NVMET_MDEV_POLL_INTERVAL	msecs_to_jiffies(10)
+#define NVMET_MDEV_POLL_HOT_US		8
 #define NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES	65536
 #define NVMET_MDEV_DEFAULT_PIN_CACHE_MAX_SEGS	64
 #define NVMET_MDEV_DEFAULT_POLL_BUDGET		128
 #define NVMET_MDEV_DEFAULT_RESPONSE_WORKERS	0
-#define NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR	7
-#define NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME	1
-#define NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING	true
+#define NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR	0
+#define NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME	0
+#define NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING	false
+#define NVMET_MDEV_DEFAULT_MMAP_DOORBELLS	true
 
 static uint pin_cache_pages = NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES;
 module_param_named(pin_cache_pages, pin_cache_pages, uint, 0644);
@@ -47,7 +51,7 @@ MODULE_PARM_DESC(pin_cache_max_segs,
 static uint poll_budget = NVMET_MDEV_DEFAULT_POLL_BUDGET;
 module_param_named(poll_budget, poll_budget, uint, 0644);
 MODULE_PARM_DESC(poll_budget,
-		 "Maximum queues examined by one bounded DBBUF poll run (default: "
+		 "Maximum queues examined by one bounded doorbell poll run (default: "
 		 __stringify(NVMET_MDEV_DEFAULT_POLL_BUDGET) ")");
 
 static uint response_workers = NVMET_MDEV_DEFAULT_RESPONSE_WORKERS;
@@ -71,7 +75,14 @@ MODULE_PARM_DESC(irq_coalesce_time,
 static bool lock_irq_coalescing = NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING;
 module_param_named(lock_irq_coalescing, lock_irq_coalescing, bool, 0644);
 MODULE_PARM_DESC(lock_irq_coalescing,
-		 "Reject guest changes to NVMe Features 08 and 09 (default: true)");
+		 "Reject guest changes to NVMe Features 08 and 09 (default: "
+		 __stringify(NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING) ")");
+
+static bool mmap_doorbells = NVMET_MDEV_DEFAULT_MMAP_DOORBELLS;
+module_param_named(mmap_doorbells, mmap_doorbells, bool, 0644);
+MODULE_PARM_DESC(mmap_doorbells,
+		 "Expose the BAR0 doorbell page through VFIO sparse mmap (default: "
+		 __stringify(NVMET_MDEV_DEFAULT_MMAP_DOORBELLS) ")");
 
 struct nvmet_mdev_iod {
 	struct list_head entry;
@@ -344,6 +355,7 @@ static u32 nvmet_mdev_cq_head(struct nvmet_mdev_ctrl *ctrl,
 }
 
 static void nvmet_mdev_activate_cq(struct nvmet_mdev_cq *cq);
+static void nvmet_mdev_kick_poller(struct nvmet_mdev_ctrl *ctrl);
 static bool nvmet_mdev_handle_cq_head(struct nvmet_mdev_cq *cq,
 				      bool resignal);
 static bool nvmet_mdev_arm_cq_event(struct nvmet_mdev_ctrl *ctrl,
@@ -449,53 +461,72 @@ static void nvmet_mdev_activate_sq(struct nvmet_mdev_sq *sq)
 		schedule_work(&sq->work);
 }
 
-static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
+static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
+				   bool include_admin)
 {
 	unsigned int qid, limit, scanned = 0;
-	bool enabled;
+	bool activity = false;
 
-	nvmet_mdev_stat_inc(ctrl, poll_wakeups);
 	nvmet_mdev_stat_inc(ctrl, poll_runs);
-	enabled = READ_ONCE(ctrl->enabled) &&
-		  smp_load_acquire(&ctrl->dbbuf_dbs) &&
-		  READ_ONCE(ctrl->dbbuf_eis);
-	if (!enabled)
-		goto unlock;
+	if (!READ_ONCE(ctrl->enabled))
+		return false;
 
 	rcu_read_lock();
-	if (ctrl->nr_queues <= 1)
+	if (!ctrl->nr_queues || (!include_admin && ctrl->nr_queues <= 1))
 		goto account;
 	qid = ctrl->poll_next_qid;
+	if (qid >= ctrl->nr_queues || (!include_admin && !qid))
+		qid = include_admin ? 0 : 1;
 	limit = min_t(unsigned int, ctrl->runtime.poll_budget,
-		      ctrl->nr_queues - 1);
+			      ctrl->nr_queues - !include_admin);
 	while (scanned < limit) {
 		struct nvmet_mdev_sq *sq = &ctrl->sqs[qid];
 		struct nvmet_mdev_cq *cq = &ctrl->cqs[qid];
 
-		if (READ_ONCE(sq->live) && nvmet_mdev_sq_tail(ctrl, sq) !=
-		    READ_ONCE(sq->head))
-			nvmet_mdev_activate_sq(sq);
-		if (READ_ONCE(cq->live)) {
+		if (smp_load_acquire(&sq->live) &&
+		    nvmet_mdev_sq_tail(ctrl, sq) != READ_ONCE(sq->head)) {
+			activity = true;
+			if (!atomic_read(&sq->runner_active))
+				nvmet_mdev_activate_sq(sq);
+		}
+		if (smp_load_acquire(&cq->live) &&
+		    (!include_admin || atomic_read(&cq->irq_outstanding) ||
+		     atomic_read(&cq->blocked) ||
+		     atomic_read(&cq->head) != smp_load_acquire(&cq->tail) ||
+		     nvmet_mdev_cq_has_completions(cq))) {
 			u32 head = nvmet_mdev_cq_head(ctrl, cq);
 
-			if (head != atomic_read(&cq->head))
+			if (head != atomic_read(&cq->head)) {
+				activity = true;
 				nvmet_mdev_handle_cq_head(cq, true);
+			}
 		}
 		scanned++;
 		qid++;
 		if (qid == ctrl->nr_queues)
-			qid = 1;
+			qid = include_admin ? 0 : 1;
 	}
 	ctrl->poll_next_qid = qid;
 account:
 	nvmet_mdev_stat_add(ctrl, poll_queue_checks, scanned);
 	rcu_read_unlock();
-unlock:
-	if (enabled) {
-		nvmet_mdev_stat_inc(ctrl, poll_sleeps);
-		schedule_delayed_work(&ctrl->poll_work,
-				      NVMET_MDEV_POLL_INTERVAL);
-	}
+	return activity;
+}
+
+static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
+{
+	bool enabled;
+
+	nvmet_mdev_stat_inc(ctrl, poll_wakeups);
+	enabled = READ_ONCE(ctrl->enabled) &&
+		  smp_load_acquire(&ctrl->dbbuf_dbs) &&
+		  READ_ONCE(ctrl->dbbuf_eis);
+	if (!enabled)
+		return;
+
+	nvmet_mdev_poll_queues(ctrl, false);
+	nvmet_mdev_stat_inc(ctrl, poll_sleeps);
+	schedule_delayed_work(&ctrl->poll_work, NVMET_MDEV_POLL_INTERVAL);
 }
 
 static void nvmet_mdev_poll_work(struct work_struct *work)
@@ -509,13 +540,63 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 
 static void nvmet_mdev_kick_poller(struct nvmet_mdev_ctrl *ctrl)
 {
-	bool enabled;
+	if (READ_ONCE(ctrl->runtime.mmap_doorbells)) {
+		if (!atomic_xchg(&ctrl->poll_kick, 1))
+			nvmet_mdev_stat_inc(ctrl, poll_wakeups);
+		wake_up_interruptible(&ctrl->poll_wait);
+		return;
+	}
 
-	enabled = READ_ONCE(ctrl->enabled) &&
-		  smp_load_acquire(&ctrl->dbbuf_dbs);
-	if (!enabled)
+	if (!READ_ONCE(ctrl->enabled) ||
+	    !smp_load_acquire(&ctrl->dbbuf_dbs))
 		return;
 	mod_delayed_work(system_wq, &ctrl->poll_work, 0);
+}
+
+static int nvmet_mdev_poll_thread(void *data)
+{
+	/* Bound idle latency without dedicating a CPU to permanent busy polling. */
+	static const unsigned int sleep_us[] = { 10, 20, 40, 100 };
+	struct nvmet_mdev_ctrl *ctrl = data;
+
+	while (!kthread_should_stop()) {
+		ktime_t hot_until;
+		unsigned int backoff = 0;
+
+		wait_event_interruptible(ctrl->poll_wait,
+			kthread_should_stop() || READ_ONCE(ctrl->enabled));
+		if (kthread_should_stop())
+			break;
+
+		atomic_set(&ctrl->poll_kick, 0);
+		hot_until = ktime_add_us(ktime_get(), NVMET_MDEV_POLL_HOT_US);
+		while (READ_ONCE(ctrl->enabled) && !kthread_should_stop()) {
+			bool kicked = atomic_xchg(&ctrl->poll_kick, 0);
+			bool activity = nvmet_mdev_poll_queues(ctrl, true);
+
+			if (activity || kicked) {
+				hot_until = ktime_add_us(ktime_get(),
+						       NVMET_MDEV_POLL_HOT_US);
+				backoff = 0;
+				continue;
+			}
+			if (ktime_before(ktime_get(), hot_until)) {
+				cpu_relax();
+				if (need_resched())
+					cond_resched();
+				continue;
+			}
+
+			nvmet_mdev_stat_inc(ctrl, poll_sleeps);
+			wait_event_interruptible_hrtimeout(ctrl->poll_wait,
+				kthread_should_stop() || !READ_ONCE(ctrl->enabled) ||
+				atomic_read(&ctrl->poll_kick),
+				us_to_ktime(sleep_us[backoff]));
+			if (backoff < ARRAY_SIZE(sleep_us) - 1)
+				backoff++;
+		}
+	}
+	return 0;
 }
 
 static void nvmet_mdev_activate_cq(struct nvmet_mdev_cq *cq)
@@ -861,6 +942,8 @@ static void nvmet_mdev_cq_work(struct work_struct *work)
 		/* Make every published phase bit visible before notification. */
 		dma_wmb();
 		nvmet_mdev_stat_add(ctrl, completions, completed);
+		/* The guest may acknowledge through the shared doorbell page. */
+		nvmet_mdev_kick_poller(ctrl);
 	}
 	if (atomic_read(&cq->head) != smp_load_acquire(&cq->tail))
 		nvmet_mdev_notify_cq(cq, completed ? completed : 1, false);
@@ -983,6 +1066,7 @@ static void nvmet_mdev_reset_irq_features(struct nvmet_mdev_ctrl *ctrl)
 int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 {
 	unsigned int qid;
+	int ret;
 
 	ctrl->runtime.pin_cache_pages = READ_ONCE(pin_cache_pages);
 	ctrl->runtime.pin_cache_max_segs = READ_ONCE(pin_cache_max_segs);
@@ -992,10 +1076,14 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		READ_ONCE(irq_coalesce_threshold);
 	ctrl->runtime.irq_coalesce_time = READ_ONCE(irq_coalesce_time);
 	ctrl->runtime.lock_irq_coalescing = READ_ONCE(lock_irq_coalescing);
+	ctrl->runtime.mmap_doorbells = READ_ONCE(mmap_doorbells) &&
+		PAGE_SIZE == SZ_4K;
 	nvmet_mdev_reset_irq_features(ctrl);
 	mutex_init(&ctrl->state_lock);
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);
-	ctrl->poll_next_qid = 1;
+	init_waitqueue_head(&ctrl->poll_wait);
+	atomic_set(&ctrl->poll_kick, 0);
+	ctrl->poll_next_qid = ctrl->runtime.mmap_doorbells ? 0 : 1;
 	ctrl->nr_queues = ctrl->tctrl->subsys->max_qid + 1;
 	init_llist_head(&ctrl->iod_free);
 	atomic_set(&ctrl->iod_free_count, 0);
@@ -1038,6 +1126,23 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		atomic_set(&cq->irq_outstanding, 0);
 		atomic_set(&cq->blocked, 0);
 		INIT_WORK(&cq->work, nvmet_mdev_cq_work);
+	}
+
+	if (ctrl->runtime.mmap_doorbells) {
+		ctrl->poll_thread = kthread_run(nvmet_mdev_poll_thread, ctrl,
+						 "nvmet-mdev-db/%s",
+						 dev_name(ctrl->vdev.dev));
+		if (IS_ERR(ctrl->poll_thread)) {
+			ret = PTR_ERR(ctrl->poll_thread);
+			ctrl->poll_thread = NULL;
+			kfree(ctrl->cqs);
+			ctrl->cqs = NULL;
+			kfree(ctrl->sqs);
+			ctrl->sqs = NULL;
+			mempool_exit(&ctrl->iod_pool);
+			ctrl->iod_pool_ready = false;
+			return ret;
+		}
 	}
 
 	return 0;
@@ -1099,8 +1204,8 @@ static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 	cq->phase = 1;
 	cq->vector = vector;
 	cq->irq_enabled = flags & NVME_CQ_IRQ_ENABLED;
-	put_unaligned_le32(0, ctrl->bar0 + NVME_REG_DBS +
-			   ((qid * 2 + 1) * sizeof(u32)));
+	WRITE_ONCE(*(__le32 *)(ctrl->bar0 + NVME_REG_DBS +
+			      ((qid * 2 + 1) * sizeof(u32))), 0);
 
 	status = nvmet_cq_create(ctrl->tctrl, &cq->nvme_cq, qid, depth);
 	if (status != NVME_SC_SUCCESS) {
@@ -1193,8 +1298,8 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 	sq->nr_response_lanes = nr_response_lanes;
 	atomic_set(&sq->runner_active, 0);
 	atomic_set(&sq->kick_pending, 0);
-	put_unaligned_le32(0, ctrl->bar0 + NVME_REG_DBS +
-			   (qid * 2 * sizeof(u32)));
+	WRITE_ONCE(*(__le32 *)(ctrl->bar0 + NVME_REG_DBS +
+			      (qid * 2 * sizeof(u32))), 0);
 
 	status = nvmet_sq_create(ctrl->tctrl, &sq->nvme_sq, &cq->nvme_cq,
 				 qid, depth);
@@ -1329,6 +1434,7 @@ static void __nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	mutex_lock(&ctrl->lock);
 	ctrl->enabled = false;
 	mutex_unlock(&ctrl->lock);
+	nvmet_mdev_kick_poller(ctrl);
 	cancel_delayed_work_sync(&ctrl->poll_work);
 
 	for (qid = ctrl->nr_queues; qid-- > 0;)
@@ -1408,6 +1514,7 @@ int nvmet_mdev_enable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	mutex_unlock(&ctrl->lock);
 	if (ret)
 		goto fail;
+	nvmet_mdev_kick_poller(ctrl);
 	goto out_unlock_state;
 
 fail:
@@ -1438,6 +1545,10 @@ void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 	struct llist_node *node;
 
 	nvmet_mdev_disable_ctrl(ctrl, 0);
+	if (ctrl->poll_thread) {
+		kthread_stop(ctrl->poll_thread);
+		ctrl->poll_thread = NULL;
+	}
 	/* Doorbell callbacks hold RCU while dereferencing the queue arrays. */
 	synchronize_rcu();
 	cancel_delayed_work_sync(&ctrl->poll_work);
@@ -1671,7 +1782,7 @@ u16 nvmet_mdev_set_dbbuf(struct nvmet_ctrl *tctrl, u64 dbs, u64 eis)
 	smp_store_release(&ctrl->dbbuf_dbs,
 			  nvmet_mdev_mapping_addr(ctrl->dbbuf_dbs_mapping));
 	mutex_unlock(&ctrl->lock);
-	mod_delayed_work(system_wq, &ctrl->poll_work, 0);
+	nvmet_mdev_kick_poller(ctrl);
 	return NVME_SC_SUCCESS;
 
 map_error:
