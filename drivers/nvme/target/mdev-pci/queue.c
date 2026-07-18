@@ -30,6 +30,7 @@ static_assert(offsetof(struct nvme_completion, status) +
 #define NVMET_MDEV_DEFAULT_RESPONSE_WORKERS	0
 #define NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR	7
 #define NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME	1
+#define NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING	true
 
 static uint pin_cache_pages = NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES;
 module_param_named(pin_cache_pages, pin_cache_pages, uint, 0644);
@@ -66,6 +67,11 @@ module_param_named(irq_coalesce_time, irq_coalesce_time, byte, 0644);
 MODULE_PARM_DESC(irq_coalesce_time,
 		 "Default NVMe Feature 08 TIME in 100 us units (default: "
 		 __stringify(NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME) ")");
+
+static bool lock_irq_coalescing = NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING;
+module_param_named(lock_irq_coalescing, lock_irq_coalescing, bool, 0644);
+MODULE_PARM_DESC(lock_irq_coalescing,
+		 "Reject guest changes to NVMe Features 08 and 09 (default: true)");
 
 struct nvmet_mdev_iod {
 	struct list_head entry;
@@ -985,6 +991,7 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	ctrl->runtime.irq_coalesce_threshold =
 		READ_ONCE(irq_coalesce_threshold);
 	ctrl->runtime.irq_coalesce_time = READ_ONCE(irq_coalesce_time);
+	ctrl->runtime.lock_irq_coalescing = READ_ONCE(lock_irq_coalescing);
 	nvmet_mdev_reset_irq_features(ctrl);
 	mutex_init(&ctrl->state_lock);
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);
@@ -1602,6 +1609,10 @@ u16 nvmet_mdev_set_feature(const struct nvmet_ctrl *tctrl, u8 feature,
 		return NVME_SC_SUCCESS;
 	if (feature == NVME_FEAT_IRQ_COALESCE) {
 		irqc = data;
+		if (ctrl->runtime.lock_irq_coalescing &&
+		    (irqc->thr != READ_ONCE(ctrl->irq_coalesce_threshold) ||
+		     irqc->time != READ_ONCE(ctrl->irq_coalesce_time)))
+			return NVME_SC_FEATURE_NOT_CHANGEABLE;
 		WRITE_ONCE(ctrl->irq_coalesce_threshold, irqc->thr);
 		WRITE_ONCE(ctrl->irq_coalesce_time, irqc->time);
 		return NVME_SC_SUCCESS;
@@ -1610,6 +1621,10 @@ u16 nvmet_mdev_set_feature(const struct nvmet_ctrl *tctrl, u8 feature,
 		irqcfg = data;
 		if (irqcfg->iv >= NVMET_MDEV_PCI_MSIX_VECTORS)
 			return NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
+		if (ctrl->runtime.lock_irq_coalescing &&
+		    irqcfg->cd != READ_ONCE(
+			    ctrl->irq_vectors[irqcfg->iv].coalescing_disabled))
+			return NVME_SC_FEATURE_NOT_CHANGEABLE;
 		WRITE_ONCE(ctrl->irq_vectors[irqcfg->iv].coalescing_disabled,
 			   irqcfg->cd);
 		return NVME_SC_SUCCESS;
