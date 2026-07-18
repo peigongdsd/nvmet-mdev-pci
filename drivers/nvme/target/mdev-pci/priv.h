@@ -112,6 +112,7 @@ struct nvmet_mdev_runtime_config {
 	unsigned int response_workers;
 	u8 irq_coalesce_threshold;
 	u8 irq_coalesce_time;
+	bool lock_irq_coalescing;
 };
 
 struct nvmet_mdev_stats {
