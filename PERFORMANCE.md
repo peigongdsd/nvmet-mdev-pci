@@ -64,12 +64,13 @@ Automatic response-worker sizing is capped by SQ depth, online CPUs, and a
 maximum of 64. Explicit values are capped by SQ depth and 64. The admin SQ
 remains ordered with one worker.
 
-The interrupt defaults aggregate up to eight completions per MSI-X vector with
-a 100 us bound. CQEs are still published immediately. A guest can replace the
-current values with the standard Set Features command, including setting them
-to zero for immediate interrupts. A controller reset restores the module
-defaults and clears Feature 09 per-vector coalescing-disable state. Admin
-completions remain immediate.
+The interrupt defaults signal when either eight completions have accumulated
+on an MSI-X vector or 100 us has elapsed since its first pending completion.
+The timer may therefore report fewer than eight completions. CQEs are still
+published immediately. A guest can replace the current values with the
+standard Set Features command, including setting them to zero for immediate
+interrupts. A controller reset restores the module defaults and clears Feature
+09 per-vector coalescing-disable state. Admin completions remain immediate.
 
 `poll_runs` counts poll function iterations and `poll_queue_checks` counts
 queue-pair loop iterations. `pinned_io_bytes` includes cache hits; actual pin
