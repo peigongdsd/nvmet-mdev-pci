@@ -324,7 +324,8 @@ static ssize_t transport_stats_show(struct device *dev,
 	return sysfs_emit(buf,
 		"commands %llu\npinned_io_bytes %llu\ncompletions %llu\n"
 		"interrupts %llu\ndoorbell_kicks %llu\npoll_runs %llu\n"
-		"poll_queue_checks %llu\nprp_heap_allocs %llu\n"
+		"poll_queue_checks %llu\nsq_tail_changes %llu\n"
+		"prp_heap_allocs %llu\n"
 		"payload_sg_heap_allocs %llu\n"
 		"pin_calls %llu\nunpin_calls %llu\n"
 		"pin_cache_hits %llu\npin_cache_misses %llu\n"
@@ -345,6 +346,7 @@ static ssize_t transport_stats_show(struct device *dev,
 		nvmet_mdev_stat_read(ctrl, doorbell_kicks),
 		nvmet_mdev_stat_read(ctrl, poll_runs),
 		nvmet_mdev_stat_read(ctrl, poll_queue_checks),
+		nvmet_mdev_stat_read(ctrl, sq_tail_changes),
 		nvmet_mdev_stat_read(ctrl, prp_heap_allocs),
 		nvmet_mdev_stat_read(ctrl, payload_sg_heap_allocs),
 		nvmet_mdev_stat_read(ctrl, pin_calls),

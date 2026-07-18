@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/bitmap.h>
 #include <linux/iommu.h>
 #include <linux/cpu.h>
 #include <linux/delay.h>
@@ -26,7 +27,8 @@ static_assert(offsetof(struct nvme_completion, status) +
 	      sizeof(struct nvme_completion));
 #define NVMET_MDEV_MAX_RESPONSE_WORKERS	64
 #define NVMET_MDEV_POLL_INTERVAL	msecs_to_jiffies(10)
-#define NVMET_MDEV_POLL_HOT_US		8
+#define NVMET_MDEV_POLL_HOT_SCANS	4
+#define NVMET_MDEV_POLL_ACTIVE_US	5
 #define NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES	65536
 #define NVMET_MDEV_DEFAULT_PIN_CACHE_MAX_SEGS	64
 #define NVMET_MDEV_DEFAULT_POLL_BUDGET		128
@@ -461,10 +463,21 @@ static void nvmet_mdev_activate_sq(struct nvmet_mdev_sq *sq)
 		schedule_work(&sq->work);
 }
 
+static void nvmet_mdev_update_poll_qid(struct nvmet_mdev_ctrl *ctrl, u16 qid)
+{
+	lockdep_assert_held(&ctrl->lock);
+	if (smp_load_acquire(&ctrl->sqs[qid].live) ||
+	    smp_load_acquire(&ctrl->cqs[qid].live))
+		set_bit(qid, ctrl->poll_qids);
+	else
+		clear_bit(qid, ctrl->poll_qids);
+}
+
 static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 				   bool include_admin)
 {
-	unsigned int qid, limit, scanned = 0;
+	unsigned int first = UINT_MAX, qid, limit, scanned = 0;
+	unsigned int minimum = include_admin ? 0 : 1;
 	bool activity = false;
 
 	nvmet_mdev_stat_inc(ctrl, poll_runs);
@@ -472,25 +485,49 @@ static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 		return false;
 
 	rcu_read_lock();
-	if (!ctrl->nr_queues || (!include_admin && ctrl->nr_queues <= 1))
+	if (!ctrl->nr_queues || minimum >= ctrl->nr_queues)
 		goto account;
 	qid = ctrl->poll_next_qid;
-	if (qid >= ctrl->nr_queues || (!include_admin && !qid))
-		qid = include_admin ? 0 : 1;
-	limit = min_t(unsigned int, ctrl->runtime.poll_budget,
-			      ctrl->nr_queues - !include_admin);
+	if (qid >= ctrl->nr_queues || qid < minimum)
+		qid = minimum;
+	limit = ctrl->runtime.poll_budget;
 	while (scanned < limit) {
-		struct nvmet_mdev_sq *sq = &ctrl->sqs[qid];
-		struct nvmet_mdev_cq *cq = &ctrl->cqs[qid];
+		struct nvmet_mdev_sq *sq;
+		struct nvmet_mdev_cq *cq;
+		u32 tail;
 
-		if (smp_load_acquire(&sq->live) &&
-		    nvmet_mdev_sq_tail(ctrl, sq) != READ_ONCE(sq->head)) {
-			activity = true;
-			if (!atomic_read(&sq->runner_active))
-				nvmet_mdev_activate_sq(sq);
+		qid = find_next_bit(ctrl->poll_qids, ctrl->nr_queues, qid);
+		if (qid >= ctrl->nr_queues) {
+			qid = find_next_bit(ctrl->poll_qids,
+					    ctrl->nr_queues, minimum);
+			if (qid >= ctrl->nr_queues)
+				break;
+		}
+		if (qid < minimum) {
+			qid = minimum;
+			continue;
+		}
+		if (qid == first)
+			break;
+		if (first == UINT_MAX)
+			first = qid;
+
+		sq = &ctrl->sqs[qid];
+		cq = &ctrl->cqs[qid];
+
+		if (smp_load_acquire(&sq->live)) {
+			tail = nvmet_mdev_sq_tail(ctrl, sq);
+			if (tail != READ_ONCE(sq->polled_tail)) {
+				WRITE_ONCE(sq->polled_tail, tail);
+				activity = true;
+				nvmet_mdev_stat_inc(ctrl, sq_tail_changes);
+				if (tail >= READ_ONCE(sq->depth) ||
+				    tail != READ_ONCE(sq->head))
+					nvmet_mdev_activate_sq(sq);
+			}
 		}
 		if (smp_load_acquire(&cq->live) &&
-		    (!include_admin || atomic_read(&cq->irq_outstanding) ||
+		    (atomic_read(&cq->irq_outstanding) ||
 		     atomic_read(&cq->blocked) ||
 		     atomic_read(&cq->head) != smp_load_acquire(&cq->tail) ||
 		     nvmet_mdev_cq_has_completions(cq))) {
@@ -504,7 +541,7 @@ static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 		scanned++;
 		qid++;
 		if (qid == ctrl->nr_queues)
-			qid = include_admin ? 0 : 1;
+			qid = minimum;
 	}
 	ctrl->poll_next_qid = qid;
 account:
@@ -555,13 +592,13 @@ static void nvmet_mdev_kick_poller(struct nvmet_mdev_ctrl *ctrl)
 
 static int nvmet_mdev_poll_thread(void *data)
 {
-	/* Bound idle latency without dedicating a CPU to permanent busy polling. */
 	static const unsigned int sleep_us[] = { 10, 20, 40, 100 };
 	struct nvmet_mdev_ctrl *ctrl = data;
 
 	while (!kthread_should_stop()) {
-		ktime_t hot_until;
 		unsigned int backoff = 0;
+		unsigned int hot_scans = NVMET_MDEV_POLL_HOT_SCANS;
+		bool cold = false;
 
 		wait_event_interruptible(ctrl->poll_wait,
 			kthread_should_stop() || READ_ONCE(ctrl->enabled));
@@ -569,18 +606,17 @@ static int nvmet_mdev_poll_thread(void *data)
 			break;
 
 		atomic_set(&ctrl->poll_kick, 0);
-		hot_until = ktime_add_us(ktime_get(), NVMET_MDEV_POLL_HOT_US);
 		while (READ_ONCE(ctrl->enabled) && !kthread_should_stop()) {
 			bool kicked = atomic_xchg(&ctrl->poll_kick, 0);
 			bool activity = nvmet_mdev_poll_queues(ctrl, true);
 
-			if (activity || kicked) {
-				hot_until = ktime_add_us(ktime_get(),
-						       NVMET_MDEV_POLL_HOT_US);
+			if (cold && (activity || kicked)) {
+				cold = false;
+				hot_scans = NVMET_MDEV_POLL_HOT_SCANS;
 				backoff = 0;
-				continue;
 			}
-			if (ktime_before(ktime_get(), hot_until)) {
+			if (hot_scans) {
+				hot_scans--;
 				cpu_relax();
 				if (need_resched())
 					cond_resched();
@@ -588,6 +624,18 @@ static int nvmet_mdev_poll_thread(void *data)
 			}
 
 			nvmet_mdev_stat_inc(ctrl, poll_sleeps);
+			if (activity || kicked) {
+				/* Bound sustained polling even if every scan sees work. */
+				wait_event_interruptible_hrtimeout(ctrl->poll_wait,
+					kthread_should_stop() ||
+					!READ_ONCE(ctrl->enabled),
+					us_to_ktime(NVMET_MDEV_POLL_ACTIVE_US));
+				cold = false;
+				backoff = 0;
+				continue;
+			}
+
+			cold = true;
 			wait_event_interruptible_hrtimeout(ctrl->poll_wait,
 				kthread_should_stop() || !READ_ONCE(ctrl->enabled) ||
 				atomic_read(&ctrl->poll_kick),
@@ -1107,6 +1155,16 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		ctrl->iod_pool_ready = false;
 		return -ENOMEM;
 	}
+	ctrl->poll_qids = bitmap_zalloc(ctrl->nr_queues, GFP_KERNEL);
+	if (!ctrl->poll_qids) {
+		kfree(ctrl->cqs);
+		ctrl->cqs = NULL;
+		kfree(ctrl->sqs);
+		ctrl->sqs = NULL;
+		mempool_exit(&ctrl->iod_pool);
+		ctrl->iod_pool_ready = false;
+		return -ENOMEM;
+	}
 
 	for (qid = 0; qid < ctrl->nr_queues; qid++) {
 		struct nvmet_mdev_sq *sq = &ctrl->sqs[qid];
@@ -1135,6 +1193,8 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		if (IS_ERR(ctrl->poll_thread)) {
 			ret = PTR_ERR(ctrl->poll_thread);
 			ctrl->poll_thread = NULL;
+			bitmap_free(ctrl->poll_qids);
+			ctrl->poll_qids = NULL;
 			kfree(ctrl->cqs);
 			ctrl->cqs = NULL;
 			kfree(ctrl->sqs);
@@ -1222,6 +1282,7 @@ static u16 nvmet_mdev_create_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 	atomic_set(&cq->kick_pending, 0);
 	atomic_set(&cq->irq_outstanding, 0);
 	smp_store_release(&cq->live, true);
+	nvmet_mdev_update_poll_qid(ctrl, qid);
 
 out_unlock:
 	mutex_unlock(&ctrl->lock);
@@ -1292,6 +1353,7 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 	sq->entries = nvmet_mdev_mapping_addr(sq->mapping);
 	sq->depth = depth;
 	sq->head = 0;
+	sq->polled_tail = 0;
 	sq->cq = cq;
 	sq->iod_wq = iod_wq;
 	sq->response_lanes = response_lanes;
@@ -1315,6 +1377,7 @@ static u16 nvmet_mdev_create_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 		goto out_destroy_wq;
 	}
 	smp_store_release(&sq->live, true);
+	nvmet_mdev_update_poll_qid(ctrl, qid);
 	mutex_unlock(&ctrl->lock);
 	return NVME_SC_SUCCESS;
 
@@ -1342,6 +1405,7 @@ static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
 	}
 	smp_store_release(&sq->live, false);
+	nvmet_mdev_update_poll_qid(ctrl, qid);
 	iod_wq = sq->iod_wq;
 	response_lanes = sq->response_lanes;
 	mutex_unlock(&ctrl->lock);
@@ -1366,6 +1430,7 @@ static u16 nvmet_mdev_delete_sq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 	sq->cq = NULL;
 	sq->depth = 0;
 	sq->head = 0;
+	sq->polled_tail = 0;
 	mutex_unlock(&ctrl->lock);
 	return NVME_SC_SUCCESS;
 }
@@ -1385,6 +1450,7 @@ static u16 nvmet_mdev_delete_cq_locked(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 		return NVME_SC_QID_INVALID | NVME_STATUS_DNR;
 	}
 	smp_store_release(&cq->live, false);
+	nvmet_mdev_update_poll_qid(ctrl, qid);
 	atomic_set(&cq->blocked, 0);
 	mutex_unlock(&ctrl->lock);
 
@@ -1552,6 +1618,8 @@ void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 	/* Doorbell callbacks hold RCU while dereferencing the queue arrays. */
 	synchronize_rcu();
 	cancel_delayed_work_sync(&ctrl->poll_work);
+	bitmap_free(ctrl->poll_qids);
+	ctrl->poll_qids = NULL;
 	kfree(ctrl->cqs);
 	ctrl->cqs = NULL;
 	kfree(ctrl->sqs);

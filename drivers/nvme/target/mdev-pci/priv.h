@@ -125,6 +125,7 @@ struct nvmet_mdev_stats {
 	local64_t doorbell_kicks;
 	local64_t poll_runs;
 	local64_t poll_queue_checks;
+	local64_t sq_tail_changes;
 	local64_t prp_heap_allocs;
 	local64_t payload_sg_heap_allocs;
 	local64_t pin_calls;
@@ -210,6 +211,8 @@ struct nvmet_mdev_sq {
 	u16 qid;
 	u16 depth;
 	u16 head;
+	/* Written only by the doorbell poller while this SQ is live. */
+	u32 polled_tail;
 	/* runner_active owns SQ head; kick_pending closes its release race. */
 	atomic_t runner_active;
 	atomic_t kick_pending;
@@ -281,6 +284,7 @@ struct nvmet_mdev_ctrl {
 	struct task_struct *poll_thread;
 	wait_queue_head_t poll_wait;
 	atomic_t poll_kick;
+	unsigned long *poll_qids;
 	unsigned int poll_next_qid;
 	struct nvmet_mdev_stats __percpu *stats;
 	struct nvmet_mdev_runtime_config runtime;
