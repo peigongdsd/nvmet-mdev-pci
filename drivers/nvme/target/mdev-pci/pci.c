@@ -2,6 +2,7 @@
 
 #include <linux/pci.h>
 #include <linux/pci_ids.h>
+#include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
@@ -10,6 +11,9 @@
 
 #define NVMET_MDEV_PCI_DEVICE_ID	0x0010
 #define NVMET_MDEV_PCI_REVISION		0x01
+
+static_assert(NVME_REG_DBS == SZ_4K);
+static_assert(NVMET_MDEV_PCI_MSIX_TABLE - NVME_REG_DBS == SZ_4K);
 
 static bool nvmet_mdev_config_byte_writable(unsigned int offset)
 {
@@ -132,7 +136,8 @@ int nvmet_mdev_pci_init(struct nvmet_mdev_ctrl *ctrl)
 	if (!ctrl->config)
 		return -ENOMEM;
 
-	ctrl->bar0 = kzalloc(NVMET_MDEV_PCI_BAR0_SIZE, GFP_KERNEL);
+	ctrl->bar0 = alloc_pages_exact(NVMET_MDEV_PCI_BAR0_SIZE,
+				       GFP_KERNEL | __GFP_ZERO);
 	if (!ctrl->bar0) {
 		kfree(ctrl->config);
 		ctrl->config = NULL;
@@ -145,10 +150,41 @@ int nvmet_mdev_pci_init(struct nvmet_mdev_ctrl *ctrl)
 
 void nvmet_mdev_pci_cleanup(struct nvmet_mdev_ctrl *ctrl)
 {
-	kfree(ctrl->bar0);
+	free_pages_exact(ctrl->bar0, NVMET_MDEV_PCI_BAR0_SIZE);
 	kfree(ctrl->config);
 	ctrl->bar0 = NULL;
 	ctrl->config = NULL;
+}
+
+int nvmet_mdev_pci_mmap(struct nvmet_mdev_ctrl *ctrl,
+			struct vm_area_struct *vma)
+{
+	const unsigned long index_shift = NVMET_MDEV_VFIO_OFFSET_SHIFT -
+		PAGE_SHIFT;
+	const unsigned long offset_mask = (1UL << index_shift) - 1;
+	unsigned long region_pgoff = vma->vm_pgoff & offset_mask;
+	unsigned int index = vma->vm_pgoff >> index_shift;
+	unsigned long region_offset = region_pgoff << PAGE_SHIFT;
+	unsigned long size = vma->vm_end - vma->vm_start;
+	int ret;
+
+	/* Only the isolated doorbell page may bypass VFIO read/write traps. */
+	if (!READ_ONCE(ctrl->runtime.mmap_doorbells) || PAGE_SIZE != SZ_4K)
+		return -EOPNOTSUPP;
+	if (index != VFIO_PCI_BAR0_REGION_INDEX ||
+	    region_offset != NVME_REG_DBS || size != SZ_4K)
+		return -EINVAL;
+	if (!(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
+		return -EINVAL;
+
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	ret = remap_pfn_range(vma, vma->vm_start,
+			      page_to_pfn(virt_to_page(ctrl->bar0 + region_offset)),
+			      size,
+			      vma->vm_page_prot);
+	if (!ret)
+		nvmet_mdev_stat_inc(ctrl, doorbell_mmaps);
+	return ret;
 }
 
 static void nvmet_mdev_config_write(struct nvmet_mdev_ctrl *ctrl,

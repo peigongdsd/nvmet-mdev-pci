@@ -7,6 +7,7 @@
 #include <linux/device.h>
 #include <linux/eventfd.h>
 #include <linux/hrtimer.h>
+#include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/llist.h>
 #include <linux/mdev.h>
@@ -113,6 +114,7 @@ struct nvmet_mdev_runtime_config {
 	u8 irq_coalesce_threshold;
 	u8 irq_coalesce_time;
 	bool lock_irq_coalescing;
+	bool mmap_doorbells;
 };
 
 struct nvmet_mdev_stats {
@@ -142,6 +144,7 @@ struct nvmet_mdev_stats {
 	local64_t poll_wakeups;
 	local64_t poll_sleeps;
 	local64_t fast_doorbell_writes;
+	local64_t doorbell_mmaps;
 	local64_t cq_head_wakeups;
 	local64_t interrupt_suppressed;
 	local64_t interrupt_resignals;
@@ -275,6 +278,9 @@ struct nvmet_mdev_ctrl {
 	__le32 *dbbuf_dbs;
 	__le32 *dbbuf_eis;
 	struct delayed_work poll_work;
+	struct task_struct *poll_thread;
+	wait_queue_head_t poll_wait;
+	atomic_t poll_kick;
 	unsigned int poll_next_qid;
 	struct nvmet_mdev_stats __percpu *stats;
 	struct nvmet_mdev_runtime_config runtime;
@@ -305,6 +311,8 @@ ssize_t nvmet_mdev_pci_read(struct nvmet_mdev_ctrl *ctrl, char __user *buf,
 ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 			     const char __user *buf, size_t count,
 			     loff_t *ppos);
+int nvmet_mdev_pci_mmap(struct nvmet_mdev_ctrl *ctrl,
+			struct vm_area_struct *vma);
 
 void nvmet_mdev_irq_cleanup(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_irq_init(struct nvmet_mdev_ctrl *ctrl);

@@ -129,10 +129,25 @@ static ssize_t nvmet_mdev_write(struct vfio_device *vdev,
 	return nvmet_mdev_pci_write(ctrl, buf, count, ppos);
 }
 
+static int nvmet_mdev_mmap(struct vfio_device *vdev,
+			   struct vm_area_struct *vma)
+{
+	struct nvmet_mdev_ctrl *ctrl =
+		container_of(vdev, struct nvmet_mdev_ctrl, vdev);
+
+	return nvmet_mdev_pci_mmap(ctrl, vma);
+}
+
 static int nvmet_mdev_region_info(struct vfio_device *vdev,
 				  struct vfio_region_info *info,
 				  struct vfio_info_cap *caps)
 {
+	struct nvmet_mdev_ctrl *ctrl =
+		container_of(vdev, struct nvmet_mdev_ctrl, vdev);
+	struct vfio_region_info_cap_sparse_mmap *sparse;
+	size_t sparse_size;
+	int ret;
+
 	if (info->index >= VFIO_PCI_NUM_REGIONS)
 		return -EINVAL;
 
@@ -145,6 +160,26 @@ static int nvmet_mdev_region_info(struct vfio_device *vdev,
 		info->size = NVMET_MDEV_PCI_BAR0_SIZE;
 		info->flags = VFIO_REGION_INFO_FLAG_READ |
 			      VFIO_REGION_INFO_FLAG_WRITE;
+		if (!READ_ONCE(ctrl->runtime.mmap_doorbells) ||
+		    PAGE_SIZE != SZ_4K)
+			break;
+
+		sparse_size = struct_size(sparse, areas, 1);
+		sparse = kzalloc(sparse_size, GFP_KERNEL);
+		if (!sparse)
+			return -ENOMEM;
+		sparse->header.id = VFIO_REGION_INFO_CAP_SPARSE_MMAP;
+		sparse->header.version = 1;
+		sparse->nr_areas = 1;
+		sparse->areas[0].offset = NVME_REG_DBS;
+		sparse->areas[0].size = NVMET_MDEV_PCI_MSIX_TABLE -
+			NVME_REG_DBS;
+		ret = vfio_info_add_capability(caps, &sparse->header,
+					   sparse_size);
+		kfree(sparse);
+		if (ret)
+			return ret;
+		info->flags |= VFIO_REGION_INFO_FLAG_MMAP;
 		break;
 	case VFIO_PCI_CONFIG_REGION_INDEX:
 		info->size = NVMET_MDEV_PCI_CONFIG_SIZE;
@@ -263,6 +298,7 @@ static const struct vfio_device_ops nvmet_mdev_device_ops = {
 	.release = nvmet_mdev_release_dev,
 	.read = nvmet_mdev_read,
 	.write = nvmet_mdev_write,
+	.mmap = nvmet_mdev_mmap,
 	.ioctl = nvmet_mdev_ioctl,
 	.get_region_info_caps = nvmet_mdev_region_info,
 	.close_device = nvmet_mdev_close,
@@ -298,7 +334,7 @@ static ssize_t transport_stats_show(struct device *dev,
 		"response_items %llu\niod_cache_hits %llu\niod_cache_misses %llu\n"
 		"sq_work_runs %llu\ncq_work_runs %llu\n"
 		"poll_wakeups %llu\npoll_sleeps %llu\n"
-		"fast_doorbell_writes %llu\n"
+		"fast_doorbell_writes %llu\ndoorbell_mmaps %llu\n"
 		"cq_head_wakeups %llu\ninterrupt_suppressed %llu\n"
 		"interrupt_resignals %llu\nsq_runner_requeues %llu\n"
 		"cq_publisher_requeues %llu\npin_cache_pages_current %u\n",
@@ -328,6 +364,7 @@ static ssize_t transport_stats_show(struct device *dev,
 		nvmet_mdev_stat_read(ctrl, poll_wakeups),
 		nvmet_mdev_stat_read(ctrl, poll_sleeps),
 		nvmet_mdev_stat_read(ctrl, fast_doorbell_writes),
+		nvmet_mdev_stat_read(ctrl, doorbell_mmaps),
 		nvmet_mdev_stat_read(ctrl, cq_head_wakeups),
 		nvmet_mdev_stat_read(ctrl, interrupt_suppressed),
 		nvmet_mdev_stat_read(ctrl, interrupt_resignals),
@@ -352,11 +389,12 @@ static ssize_t runtime_config_show(struct device *dev,
 		"response_workers %u\n"
 		"irq_coalesce_threshold %u\n"
 		"irq_coalesce_time %u\n"
-		"lock_irq_coalescing %u\n",
+		"lock_irq_coalescing %u\n"
+		"mmap_doorbells %u\n",
 		cfg->pin_cache_pages, cfg->pin_cache_max_segs,
 		cfg->poll_budget, cfg->response_workers,
 		cfg->irq_coalesce_threshold, cfg->irq_coalesce_time,
-		cfg->lock_irq_coalescing);
+		cfg->lock_irq_coalescing, cfg->mmap_doorbells);
 }
 static DEVICE_ATTR_RO(runtime_config);
 
