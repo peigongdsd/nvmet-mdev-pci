@@ -352,9 +352,6 @@ static ssize_t transport_stats_show(struct device *dev,
 		"fast_doorbell_writes %llu\ndoorbell_mmaps %llu\n"
 		"kvm_track_writes %llu\nkvm_track_activations %llu\n"
 		"kvm_track_retries %llu\nkvm_track_failures %llu\n"
-		"umonitor_waits %llu\numonitor_wakeups %llu\n"
-		"umonitor_rechecks %llu\numonitor_watchdog_runs %llu\n"
-		"umonitor_watchdog_activity %llu\n"
 		"cq_head_wakeups %llu\ninterrupt_suppressed %llu\n"
 		"interrupt_resignals %llu\nsq_runner_requeues %llu\n"
 		"cq_publisher_requeues %llu\npin_cache_pages_current %u\n",
@@ -390,11 +387,6 @@ static ssize_t transport_stats_show(struct device *dev,
 		nvmet_mdev_stat_read(ctrl, kvm_track_activations),
 		nvmet_mdev_stat_read(ctrl, kvm_track_retries),
 		nvmet_mdev_stat_read(ctrl, kvm_track_failures),
-		nvmet_mdev_stat_read(ctrl, umonitor_waits),
-		nvmet_mdev_stat_read(ctrl, umonitor_wakeups),
-		nvmet_mdev_stat_read(ctrl, umonitor_rechecks),
-		nvmet_mdev_stat_read(ctrl, umonitor_watchdog_runs),
-		nvmet_mdev_stat_read(ctrl, umonitor_watchdog_activity),
 		nvmet_mdev_stat_read(ctrl, cq_head_wakeups),
 		nvmet_mdev_stat_read(ctrl, interrupt_suppressed),
 		nvmet_mdev_stat_read(ctrl, interrupt_resignals),
@@ -421,17 +413,12 @@ static ssize_t runtime_config_show(struct device *dev,
 		"irq_coalesce_time %u\n"
 		"lock_irq_coalescing %u\n"
 		"mmap_doorbells %u\n"
-		"umonitor_doorbells %u\n"
-		"umonitor_workers %u\n"
-		"umonitor_active %u\n"
 		"kvm_doorbell_tracking %u\n"
 		"kvm_doorbell_tracking_active %u\n",
 		cfg->pin_cache_pages, cfg->pin_cache_max_segs,
 		cfg->poll_budget, cfg->response_workers,
 		cfg->irq_coalesce_threshold, cfg->irq_coalesce_time,
 		cfg->lock_irq_coalescing, cfg->mmap_doorbells,
-		cfg->umonitor_doorbells, cfg->umonitor_workers,
-		nvmet_mdev_umonitor_active(ctrl),
 		cfg->kvm_doorbell_tracking,
 		nvmet_mdev_kvm_tracking_active(ctrl));
 }

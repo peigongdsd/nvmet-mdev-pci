@@ -473,43 +473,6 @@ static void nvmet_mdev_update_poll_qid(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 		clear_bit(qid, ctrl->poll_qids);
 }
 
-static bool nvmet_mdev_poll_qid(struct nvmet_mdev_ctrl *ctrl, unsigned int qid)
-{
-	struct nvmet_mdev_sq *sq = &ctrl->sqs[qid];
-	struct nvmet_mdev_cq *cq = &ctrl->cqs[qid];
-	bool activity = false;
-	u32 tail;
-
-	mutex_lock(&sq->poll_lock);
-	rcu_read_lock();
-	if (smp_load_acquire(&sq->live)) {
-		tail = nvmet_mdev_sq_tail(ctrl, sq);
-		if (tail != READ_ONCE(sq->polled_tail)) {
-			WRITE_ONCE(sq->polled_tail, tail);
-			activity = true;
-			nvmet_mdev_stat_inc(ctrl, sq_tail_changes);
-			if (tail >= READ_ONCE(sq->depth) ||
-			    tail != READ_ONCE(sq->head))
-				nvmet_mdev_activate_sq(sq);
-		}
-	}
-	if (smp_load_acquire(&cq->live) &&
-	    (atomic_read(&cq->irq_outstanding) ||
-	     atomic_read(&cq->blocked) ||
-	     atomic_read(&cq->head) != smp_load_acquire(&cq->tail) ||
-	     nvmet_mdev_cq_has_completions(cq))) {
-		u32 head = nvmet_mdev_cq_head(ctrl, cq);
-
-		if (head != atomic_read(&cq->head)) {
-			activity = true;
-			nvmet_mdev_handle_cq_head(cq, true);
-		}
-	}
-	rcu_read_unlock();
-	mutex_unlock(&sq->poll_lock);
-	return activity;
-}
-
 static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 				   bool include_admin, unsigned int budget)
 {
@@ -521,6 +484,7 @@ static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 	if (!READ_ONCE(ctrl->enabled))
 		return false;
 
+	rcu_read_lock();
 	if (!ctrl->nr_queues || minimum >= ctrl->nr_queues)
 		goto account;
 	qid = ctrl->poll_next_qid;
@@ -528,6 +492,10 @@ static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 		qid = minimum;
 	limit = budget;
 	while (scanned < limit) {
+		struct nvmet_mdev_sq *sq;
+		struct nvmet_mdev_cq *cq;
+		u32 tail;
+
 		qid = find_next_bit(ctrl->poll_qids, ctrl->nr_queues, qid);
 		if (qid >= ctrl->nr_queues) {
 			qid = find_next_bit(ctrl->poll_qids,
@@ -544,7 +512,32 @@ static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 		if (first == UINT_MAX)
 			first = qid;
 
-		activity |= nvmet_mdev_poll_qid(ctrl, qid);
+		sq = &ctrl->sqs[qid];
+		cq = &ctrl->cqs[qid];
+
+		if (smp_load_acquire(&sq->live)) {
+			tail = nvmet_mdev_sq_tail(ctrl, sq);
+			if (tail != READ_ONCE(sq->polled_tail)) {
+				WRITE_ONCE(sq->polled_tail, tail);
+				activity = true;
+				nvmet_mdev_stat_inc(ctrl, sq_tail_changes);
+				if (tail >= READ_ONCE(sq->depth) ||
+				    tail != READ_ONCE(sq->head))
+					nvmet_mdev_activate_sq(sq);
+			}
+		}
+		if (smp_load_acquire(&cq->live) &&
+		    (atomic_read(&cq->irq_outstanding) ||
+		     atomic_read(&cq->blocked) ||
+		     atomic_read(&cq->head) != smp_load_acquire(&cq->tail) ||
+		     nvmet_mdev_cq_has_completions(cq))) {
+			u32 head = nvmet_mdev_cq_head(ctrl, cq);
+
+			if (head != atomic_read(&cq->head)) {
+				activity = true;
+				nvmet_mdev_handle_cq_head(cq, true);
+			}
+		}
 		scanned++;
 		qid++;
 		if (qid == ctrl->nr_queues)
@@ -553,49 +546,19 @@ static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 	ctrl->poll_next_qid = qid;
 account:
 	nvmet_mdev_stat_add(ctrl, poll_queue_checks, scanned);
+	rcu_read_unlock();
 	return activity;
 }
 
-static bool nvmet_mdev_poll_queue_range(struct nvmet_mdev_ctrl *ctrl,
-					unsigned int first, unsigned int last)
+void nvmet_mdev_rescan_doorbells(struct nvmet_mdev_ctrl *ctrl)
 {
-	unsigned int qid, scanned = 0;
-	bool activity = false;
-
-	nvmet_mdev_stat_inc(ctrl, poll_runs);
-	if (!READ_ONCE(ctrl->enabled))
-		return false;
-
-	last = min(last, READ_ONCE(ctrl->nr_queues));
-	for (qid = find_next_bit(ctrl->poll_qids, last, first);
-	     qid < last;
-	     qid = find_next_bit(ctrl->poll_qids, last, qid + 1)) {
-		activity |= nvmet_mdev_poll_qid(ctrl, qid);
-		scanned++;
-	}
-	nvmet_mdev_stat_add(ctrl, poll_queue_checks, scanned);
-	return activity;
-}
-
-bool nvmet_mdev_rescan_doorbells(struct nvmet_mdev_ctrl *ctrl)
-{
-	return nvmet_mdev_poll_queue_range(ctrl, 0, READ_ONCE(ctrl->nr_queues));
-}
-
-bool nvmet_mdev_poll_doorbell_line(struct nvmet_mdev_ctrl *ctrl,
-					   unsigned int line)
-{
-	unsigned int first = line * NVMET_MDEV_UMONITOR_QUEUES_PER_LINE;
-	unsigned int last = first + NVMET_MDEV_UMONITOR_QUEUES_PER_LINE;
-
-	return nvmet_mdev_poll_queue_range(ctrl, first, last);
+	nvmet_mdev_poll_queues(ctrl, true, READ_ONCE(ctrl->nr_queues));
 }
 
 static bool nvmet_mdev_poller_required(struct nvmet_mdev_ctrl *ctrl)
 {
 	/* A later queue scan acquires DBBUF; tracking itself covers only BAR0. */
-	return (!nvmet_mdev_umonitor_active(ctrl) &&
-		!nvmet_mdev_kvm_tracking_active(ctrl)) ||
+	return !nvmet_mdev_kvm_tracking_active(ctrl) ||
 	       READ_ONCE(ctrl->dbbuf_dbs);
 }
 
@@ -1184,17 +1147,15 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	ctrl->runtime.lock_irq_coalescing = READ_ONCE(lock_irq_coalescing);
 	ctrl->runtime.mmap_doorbells = READ_ONCE(mmap_doorbells) &&
 		PAGE_SIZE == SZ_4K;
-	ctrl->runtime.umonitor_workers =
-		nvmet_mdev_umonitor_requested_workers();
-	ctrl->runtime.umonitor_doorbells =
+	ctrl->runtime.kvm_doorbell_tracking =
 		ctrl->runtime.mmap_doorbells &&
-		nvmet_mdev_umonitor_requested() &&
-		ctrl->runtime.umonitor_workers;
+		nvmet_mdev_kvm_tracking_requested();
 	nvmet_mdev_reset_irq_features(ctrl);
 	mutex_init(&ctrl->state_lock);
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);
 	init_waitqueue_head(&ctrl->poll_wait);
 	atomic_set(&ctrl->poll_kick, 0);
+	nvmet_mdev_kvm_tracking_init(ctrl);
 	ctrl->poll_next_qid = ctrl->runtime.mmap_doorbells ? 0 : 1;
 	ctrl->nr_queues = ctrl->tctrl->subsys->max_qid + 1;
 	init_llist_head(&ctrl->iod_free);
@@ -1236,7 +1197,6 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 
 		sq->ctrl = ctrl;
 		sq->qid = qid;
-		mutex_init(&sq->poll_lock);
 		INIT_WORK(&sq->work, nvmet_mdev_sq_work);
 		atomic_set(&sq->runner_active, 0);
 		atomic_set(&sq->kick_pending, 0);
@@ -1250,14 +1210,6 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		atomic_set(&cq->blocked, 0);
 		INIT_WORK(&cq->work, nvmet_mdev_cq_work);
 	}
-	ctrl->runtime.umonitor_doorbells = nvmet_mdev_umonitor_init(ctrl);
-	if (!ctrl->runtime.umonitor_doorbells)
-		ctrl->runtime.umonitor_workers = 0;
-	ctrl->runtime.kvm_doorbell_tracking =
-		ctrl->runtime.mmap_doorbells &&
-		!ctrl->runtime.umonitor_doorbells &&
-		nvmet_mdev_kvm_tracking_requested();
-	nvmet_mdev_kvm_tracking_init(ctrl);
 
 	if (ctrl->runtime.mmap_doorbells) {
 		ctrl->poll_thread = kthread_run(nvmet_mdev_poll_thread, ctrl,
@@ -1266,7 +1218,6 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 		if (IS_ERR(ctrl->poll_thread)) {
 			ret = PTR_ERR(ctrl->poll_thread);
 			ctrl->poll_thread = NULL;
-			nvmet_mdev_umonitor_cleanup(ctrl);
 			bitmap_free(ctrl->poll_qids);
 			ctrl->poll_qids = NULL;
 			kfree(ctrl->cqs);
@@ -1574,7 +1525,6 @@ static void __nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	mutex_lock(&ctrl->lock);
 	ctrl->enabled = false;
 	mutex_unlock(&ctrl->lock);
-	nvmet_mdev_umonitor_disable(ctrl);
 	nvmet_mdev_kick_poller(ctrl);
 	cancel_delayed_work_sync(&ctrl->poll_work);
 
@@ -1655,7 +1605,6 @@ int nvmet_mdev_enable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc)
 	mutex_unlock(&ctrl->lock);
 	if (ret)
 		goto fail;
-	nvmet_mdev_umonitor_enable(ctrl);
 	nvmet_mdev_kick_poller(ctrl);
 	goto out_unlock_state;
 
@@ -1688,7 +1637,6 @@ void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 
 	nvmet_mdev_kvm_tracking_close(ctrl);
 	nvmet_mdev_disable_ctrl(ctrl, 0);
-	nvmet_mdev_umonitor_cleanup(ctrl);
 	if (ctrl->poll_thread) {
 		kthread_stop(ctrl->poll_thread);
 		ctrl->poll_thread = NULL;
