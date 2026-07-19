@@ -142,6 +142,7 @@ config NVME_TARGET_MDEV_PCI
 	depends on NVME_TARGET && VFIO
 	depends on NVME_CORE=y || NVME_CORE=NVME_TARGET
 	select VFIO_MDEV
+	select KVM_EXTERNAL_WRITE_TRACKING if X86 && KVM
 	help
 	  This enables an NVMe PCI target transport that exposes nvmet
 	  controllers as VFIO mediated devices for assignment to virtual
@@ -150,7 +151,9 @@ config NVME_TARGET_MDEV_PCI
 	  The driver registers an mdev parent for each enabled nvmet port and
 	  exposes PCI configuration space, NVMe BAR0 registers and MSI-X through
 	  VFIO. It supports admin and I/O queues, request-lifetime pinned PRP
-	  payloads, interrupt coalescing and shadow doorbells.
+	  payloads, interrupt coalescing and shadow doorbells. On x86 systems
+	  with KVM, the sparsely mapped doorbell page can use KVM write tracking
+	  for direct in-kernel SQ and CQ notification.
 
 	  If unsure, say N.
 

@@ -135,7 +135,11 @@ static int nvmet_mdev_mmap(struct vfio_device *vdev,
 	struct nvmet_mdev_ctrl *ctrl =
 		container_of(vdev, struct nvmet_mdev_ctrl, vdev);
 
-	return nvmet_mdev_pci_mmap(ctrl, vma);
+	int ret = nvmet_mdev_pci_mmap(ctrl, vma);
+
+	if (!ret)
+		nvmet_mdev_kvm_tracking_mmap(ctrl, vma->vm_start);
+	return ret;
 }
 
 static int nvmet_mdev_region_info(struct vfio_device *vdev,
@@ -275,12 +279,21 @@ static void nvmet_mdev_close(struct vfio_device *vdev)
 	struct nvmet_mdev_ctrl *ctrl =
 		container_of(vdev, struct nvmet_mdev_ctrl, vdev);
 
+	nvmet_mdev_kvm_tracking_close(ctrl);
 	nvmet_mdev_disable_ctrl(ctrl, 0);
 	mutex_lock(&ctrl->lock);
 	nvmet_mdev_unmap_all(ctrl);
 	mutex_unlock(&ctrl->lock);
 	nvmet_mdev_iova_reset(ctrl);
 	nvmet_mdev_irq_cleanup(ctrl);
+}
+
+static int nvmet_mdev_open(struct vfio_device *vdev)
+{
+	struct nvmet_mdev_ctrl *ctrl =
+		container_of(vdev, struct nvmet_mdev_ctrl, vdev);
+
+	return nvmet_mdev_kvm_tracking_open(ctrl);
 }
 
 static void nvmet_mdev_vfio_dma_unmap(struct vfio_device *vdev, u64 iova,
@@ -301,6 +314,7 @@ static const struct vfio_device_ops nvmet_mdev_device_ops = {
 	.mmap = nvmet_mdev_mmap,
 	.ioctl = nvmet_mdev_ioctl,
 	.get_region_info_caps = nvmet_mdev_region_info,
+	.open_device = nvmet_mdev_open,
 	.close_device = nvmet_mdev_close,
 	.dma_unmap = nvmet_mdev_vfio_dma_unmap,
 	.bind_iommufd = vfio_iommufd_emulated_bind,
@@ -336,6 +350,8 @@ static ssize_t transport_stats_show(struct device *dev,
 		"sq_work_runs %llu\ncq_work_runs %llu\n"
 		"poll_wakeups %llu\npoll_sleeps %llu\n"
 		"fast_doorbell_writes %llu\ndoorbell_mmaps %llu\n"
+		"kvm_track_writes %llu\nkvm_track_activations %llu\n"
+		"kvm_track_retries %llu\nkvm_track_failures %llu\n"
 		"cq_head_wakeups %llu\ninterrupt_suppressed %llu\n"
 		"interrupt_resignals %llu\nsq_runner_requeues %llu\n"
 		"cq_publisher_requeues %llu\npin_cache_pages_current %u\n",
@@ -367,6 +383,10 @@ static ssize_t transport_stats_show(struct device *dev,
 		nvmet_mdev_stat_read(ctrl, poll_sleeps),
 		nvmet_mdev_stat_read(ctrl, fast_doorbell_writes),
 		nvmet_mdev_stat_read(ctrl, doorbell_mmaps),
+		nvmet_mdev_stat_read(ctrl, kvm_track_writes),
+		nvmet_mdev_stat_read(ctrl, kvm_track_activations),
+		nvmet_mdev_stat_read(ctrl, kvm_track_retries),
+		nvmet_mdev_stat_read(ctrl, kvm_track_failures),
 		nvmet_mdev_stat_read(ctrl, cq_head_wakeups),
 		nvmet_mdev_stat_read(ctrl, interrupt_suppressed),
 		nvmet_mdev_stat_read(ctrl, interrupt_resignals),
@@ -392,11 +412,15 @@ static ssize_t runtime_config_show(struct device *dev,
 		"irq_coalesce_threshold %u\n"
 		"irq_coalesce_time %u\n"
 		"lock_irq_coalescing %u\n"
-		"mmap_doorbells %u\n",
+		"mmap_doorbells %u\n"
+		"kvm_doorbell_tracking %u\n"
+		"kvm_doorbell_tracking_active %u\n",
 		cfg->pin_cache_pages, cfg->pin_cache_max_segs,
 		cfg->poll_budget, cfg->response_workers,
 		cfg->irq_coalesce_threshold, cfg->irq_coalesce_time,
-		cfg->lock_irq_coalescing, cfg->mmap_doorbells);
+		cfg->lock_irq_coalescing, cfg->mmap_doorbells,
+		cfg->kvm_doorbell_tracking,
+		nvmet_mdev_kvm_tracking_active(ctrl));
 }
 static DEVICE_ATTR_RO(runtime_config);
 

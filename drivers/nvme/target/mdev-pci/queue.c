@@ -474,7 +474,7 @@ static void nvmet_mdev_update_poll_qid(struct nvmet_mdev_ctrl *ctrl, u16 qid)
 }
 
 static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
-				   bool include_admin)
+				   bool include_admin, unsigned int budget)
 {
 	unsigned int first = UINT_MAX, qid, limit, scanned = 0;
 	unsigned int minimum = include_admin ? 0 : 1;
@@ -490,7 +490,7 @@ static bool nvmet_mdev_poll_queues(struct nvmet_mdev_ctrl *ctrl,
 	qid = ctrl->poll_next_qid;
 	if (qid >= ctrl->nr_queues || qid < minimum)
 		qid = minimum;
-	limit = ctrl->runtime.poll_budget;
+	limit = budget;
 	while (scanned < limit) {
 		struct nvmet_mdev_sq *sq;
 		struct nvmet_mdev_cq *cq;
@@ -550,6 +550,18 @@ account:
 	return activity;
 }
 
+void nvmet_mdev_rescan_doorbells(struct nvmet_mdev_ctrl *ctrl)
+{
+	nvmet_mdev_poll_queues(ctrl, true, READ_ONCE(ctrl->nr_queues));
+}
+
+static bool nvmet_mdev_poller_required(struct nvmet_mdev_ctrl *ctrl)
+{
+	/* A later queue scan acquires DBBUF; tracking itself covers only BAR0. */
+	return !nvmet_mdev_kvm_tracking_active(ctrl) ||
+	       READ_ONCE(ctrl->dbbuf_dbs);
+}
+
 static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 {
 	bool enabled;
@@ -561,7 +573,7 @@ static void nvmet_mdev_budget_poll(struct nvmet_mdev_ctrl *ctrl)
 	if (!enabled)
 		return;
 
-	nvmet_mdev_poll_queues(ctrl, false);
+	nvmet_mdev_poll_queues(ctrl, false, ctrl->runtime.poll_budget);
 	nvmet_mdev_stat_inc(ctrl, poll_sleeps);
 	schedule_delayed_work(&ctrl->poll_work, NVMET_MDEV_POLL_INTERVAL);
 }
@@ -578,6 +590,8 @@ static void nvmet_mdev_poll_work(struct work_struct *work)
 static void nvmet_mdev_kick_poller(struct nvmet_mdev_ctrl *ctrl)
 {
 	if (READ_ONCE(ctrl->runtime.mmap_doorbells)) {
+		if (!nvmet_mdev_poller_required(ctrl))
+			return;
 		if (!atomic_xchg(&ctrl->poll_kick, 1))
 			nvmet_mdev_stat_inc(ctrl, poll_wakeups);
 		wake_up_interruptible(&ctrl->poll_wait);
@@ -601,14 +615,19 @@ static int nvmet_mdev_poll_thread(void *data)
 		bool cold = false;
 
 		wait_event_interruptible(ctrl->poll_wait,
-			kthread_should_stop() || READ_ONCE(ctrl->enabled));
+			kthread_should_stop() ||
+			(READ_ONCE(ctrl->enabled) &&
+			 nvmet_mdev_poller_required(ctrl)));
 		if (kthread_should_stop())
 			break;
 
 		atomic_set(&ctrl->poll_kick, 0);
-		while (READ_ONCE(ctrl->enabled) && !kthread_should_stop()) {
+		while (READ_ONCE(ctrl->enabled) &&
+		       nvmet_mdev_poller_required(ctrl) &&
+		       !kthread_should_stop()) {
 			bool kicked = atomic_xchg(&ctrl->poll_kick, 0);
-			bool activity = nvmet_mdev_poll_queues(ctrl, true);
+			bool activity = nvmet_mdev_poll_queues(ctrl, true,
+						 ctrl->runtime.poll_budget);
 
 			if (cold && (activity || kicked)) {
 				cold = false;
@@ -628,7 +647,8 @@ static int nvmet_mdev_poll_thread(void *data)
 				/* Bound sustained polling even if every scan sees work. */
 				wait_event_interruptible_hrtimeout(ctrl->poll_wait,
 					kthread_should_stop() ||
-					!READ_ONCE(ctrl->enabled),
+					!READ_ONCE(ctrl->enabled) ||
+					!nvmet_mdev_poller_required(ctrl),
 					us_to_ktime(NVMET_MDEV_POLL_ACTIVE_US));
 				cold = false;
 				backoff = 0;
@@ -638,6 +658,7 @@ static int nvmet_mdev_poll_thread(void *data)
 			cold = true;
 			wait_event_interruptible_hrtimeout(ctrl->poll_wait,
 				kthread_should_stop() || !READ_ONCE(ctrl->enabled) ||
+				!nvmet_mdev_poller_required(ctrl) ||
 				atomic_read(&ctrl->poll_kick),
 				us_to_ktime(sleep_us[backoff]));
 			if (backoff < ARRAY_SIZE(sleep_us) - 1)
@@ -1126,11 +1147,15 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	ctrl->runtime.lock_irq_coalescing = READ_ONCE(lock_irq_coalescing);
 	ctrl->runtime.mmap_doorbells = READ_ONCE(mmap_doorbells) &&
 		PAGE_SIZE == SZ_4K;
+	ctrl->runtime.kvm_doorbell_tracking =
+		ctrl->runtime.mmap_doorbells &&
+		nvmet_mdev_kvm_tracking_requested();
 	nvmet_mdev_reset_irq_features(ctrl);
 	mutex_init(&ctrl->state_lock);
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);
 	init_waitqueue_head(&ctrl->poll_wait);
 	atomic_set(&ctrl->poll_kick, 0);
+	nvmet_mdev_kvm_tracking_init(ctrl);
 	ctrl->poll_next_qid = ctrl->runtime.mmap_doorbells ? 0 : 1;
 	ctrl->nr_queues = ctrl->tctrl->subsys->max_qid + 1;
 	init_llist_head(&ctrl->iod_free);
@@ -1610,6 +1635,7 @@ void nvmet_mdev_queue_cleanup(struct nvmet_mdev_ctrl *ctrl)
 {
 	struct llist_node *node;
 
+	nvmet_mdev_kvm_tracking_close(ctrl);
 	nvmet_mdev_disable_ctrl(ctrl, 0);
 	if (ctrl->poll_thread) {
 		kthread_stop(ctrl->poll_thread);
