@@ -38,9 +38,6 @@
 #define NVMET_MDEV_PCI_MSIX_TABLE	0x2000
 #define NVMET_MDEV_PCI_MSIX_PBA		0x3000
 #define NVMET_MDEV_INLINE_SEGS		32
-#define NVMET_MDEV_UMONITOR_LINE_SIZE	64
-#define NVMET_MDEV_UMONITOR_QUEUES_PER_LINE \
-	(NVMET_MDEV_UMONITOR_LINE_SIZE / (2 * sizeof(u32)))
 
 #define NVMET_MDEV_VFIO_OFFSET_SHIFT	40
 #define NVMET_MDEV_VFIO_OFFSET_MASK	\
@@ -122,8 +119,6 @@ struct nvmet_mdev_runtime_config {
 	u8 irq_coalesce_time;
 	bool lock_irq_coalescing;
 	bool mmap_doorbells;
-	bool umonitor_doorbells;
-	unsigned int umonitor_workers;
 	bool kvm_doorbell_tracking;
 };
 
@@ -160,11 +155,6 @@ struct nvmet_mdev_stats {
 	local64_t kvm_track_activations;
 	local64_t kvm_track_retries;
 	local64_t kvm_track_failures;
-	local64_t umonitor_waits;
-	local64_t umonitor_wakeups;
-	local64_t umonitor_rechecks;
-	local64_t umonitor_watchdog_runs;
-	local64_t umonitor_watchdog_activity;
 	local64_t cq_head_wakeups;
 	local64_t interrupt_suppressed;
 	local64_t interrupt_resignals;
@@ -184,23 +174,6 @@ struct nvmet_mdev_kvm_tracker {
 	bool registered;
 	bool active;
 	bool closing;
-};
-#endif
-
-#ifdef CONFIG_X86
-struct nvmet_mdev_umonitor_worker {
-	struct nvmet_mdev_ctrl *ctrl;
-	struct task_struct *task;
-	unsigned int line;
-};
-
-struct nvmet_mdev_umonitor {
-	struct nvmet_mdev_umonitor_worker *workers;
-	struct hrtimer watchdog;
-	struct work_struct watchdog_work;
-	atomic_t watchdog_pending;
-	unsigned int nr_workers;
-	bool initialized;
 };
 #endif
 
@@ -258,13 +231,11 @@ struct nvmet_mdev_sq {
 	struct workqueue_struct *iod_wq;
 	struct nvmet_mdev_response_lane *response_lanes;
 	unsigned int nr_response_lanes;
-	/* Serializes scans of this SQ and its same-QID CQ doorbell. */
-	struct mutex poll_lock;
 	u8 *entries;
 	u16 qid;
 	u16 depth;
 	u16 head;
-	/* Serialized by poll_lock while this SQ is live. */
+	/* Written only by the doorbell poller while this SQ is live. */
 	u32 polled_tail;
 	/* runner_active owns SQ head; kick_pending closes its release race. */
 	atomic_t runner_active;
@@ -344,9 +315,6 @@ struct nvmet_mdev_ctrl {
 #if defined(CONFIG_X86) && IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING)
 	struct nvmet_mdev_kvm_tracker kvm_tracker;
 #endif
-#ifdef CONFIG_X86
-	struct nvmet_mdev_umonitor umonitor;
-#endif
 	mempool_t iod_pool;
 	struct llist_head iod_free;
 	atomic_t iod_free_count;
@@ -414,52 +382,7 @@ void nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc);
 void nvmet_mdev_disable_ctrl_locked(struct nvmet_mdev_ctrl *ctrl, u32 cc);
 void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 				  bool cq);
-bool nvmet_mdev_rescan_doorbells(struct nvmet_mdev_ctrl *ctrl);
-bool nvmet_mdev_poll_doorbell_line(struct nvmet_mdev_ctrl *ctrl,
-					   unsigned int line);
-
-#ifdef CONFIG_X86
-bool nvmet_mdev_umonitor_requested(void);
-unsigned int nvmet_mdev_umonitor_requested_workers(void);
-bool nvmet_mdev_umonitor_init(struct nvmet_mdev_ctrl *ctrl);
-void nvmet_mdev_umonitor_enable(struct nvmet_mdev_ctrl *ctrl);
-void nvmet_mdev_umonitor_disable(struct nvmet_mdev_ctrl *ctrl);
-void nvmet_mdev_umonitor_cleanup(struct nvmet_mdev_ctrl *ctrl);
-bool nvmet_mdev_umonitor_active(const struct nvmet_mdev_ctrl *ctrl);
-#else
-static inline bool nvmet_mdev_umonitor_requested(void)
-{
-	return false;
-}
-
-static inline unsigned int nvmet_mdev_umonitor_requested_workers(void)
-{
-	return 0;
-}
-
-static inline bool nvmet_mdev_umonitor_init(struct nvmet_mdev_ctrl *ctrl)
-{
-	return false;
-}
-
-static inline void nvmet_mdev_umonitor_enable(struct nvmet_mdev_ctrl *ctrl)
-{
-}
-
-static inline void nvmet_mdev_umonitor_disable(struct nvmet_mdev_ctrl *ctrl)
-{
-}
-
-static inline void nvmet_mdev_umonitor_cleanup(struct nvmet_mdev_ctrl *ctrl)
-{
-}
-
-static inline bool
-nvmet_mdev_umonitor_active(const struct nvmet_mdev_ctrl *ctrl)
-{
-	return false;
-}
-#endif
+void nvmet_mdev_rescan_doorbells(struct nvmet_mdev_ctrl *ctrl);
 
 #if defined(CONFIG_X86) && IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING)
 bool nvmet_mdev_kvm_tracking_requested(void);
