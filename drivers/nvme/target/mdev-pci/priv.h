@@ -25,6 +25,10 @@
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
 
+#if defined(CONFIG_X86) && IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING)
+#include <asm/kvm_page_track.h>
+#endif
+
 #include "../nvmet.h"
 
 #define NVMET_MDEV_PCI_CONFIG_SIZE	SZ_4K
@@ -115,6 +119,7 @@ struct nvmet_mdev_runtime_config {
 	u8 irq_coalesce_time;
 	bool lock_irq_coalescing;
 	bool mmap_doorbells;
+	bool kvm_doorbell_tracking;
 };
 
 struct nvmet_mdev_stats {
@@ -146,12 +151,31 @@ struct nvmet_mdev_stats {
 	local64_t poll_sleeps;
 	local64_t fast_doorbell_writes;
 	local64_t doorbell_mmaps;
+	local64_t kvm_track_writes;
+	local64_t kvm_track_activations;
+	local64_t kvm_track_retries;
+	local64_t kvm_track_failures;
 	local64_t cq_head_wakeups;
 	local64_t interrupt_suppressed;
 	local64_t interrupt_resignals;
 	local64_t sq_runner_requeues;
 	local64_t cq_publisher_requeues;
 };
+
+#if defined(CONFIG_X86) && IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING)
+struct nvmet_mdev_kvm_tracker {
+	struct kvm_page_track_notifier_node notifier;
+	struct delayed_work activate_work;
+	/* Serializes notifier, BAR mapping and activation lifecycle state. */
+	struct mutex lock;
+	unsigned long doorbell_hva;
+	gfn_t doorbell_gfn;
+	unsigned int retries;
+	bool registered;
+	bool active;
+	bool closing;
+};
+#endif
 
 #define nvmet_mdev_stat_add(ctrl, member, value) do { \
 	struct nvmet_mdev_stats *__stats; \
@@ -288,6 +312,9 @@ struct nvmet_mdev_ctrl {
 	unsigned int poll_next_qid;
 	struct nvmet_mdev_stats __percpu *stats;
 	struct nvmet_mdev_runtime_config runtime;
+#if defined(CONFIG_X86) && IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING)
+	struct nvmet_mdev_kvm_tracker kvm_tracker;
+#endif
 	mempool_t iod_pool;
 	struct llist_head iod_free;
 	atomic_t iod_free_count;
@@ -355,6 +382,51 @@ void nvmet_mdev_disable_ctrl(struct nvmet_mdev_ctrl *ctrl, u32 cc);
 void nvmet_mdev_disable_ctrl_locked(struct nvmet_mdev_ctrl *ctrl, u32 cc);
 void nvmet_mdev_schedule_doorbell(struct nvmet_mdev_ctrl *ctrl, u16 qid,
 				  bool cq);
+void nvmet_mdev_rescan_doorbells(struct nvmet_mdev_ctrl *ctrl);
+
+#if defined(CONFIG_X86) && IS_ENABLED(CONFIG_KVM_EXTERNAL_WRITE_TRACKING)
+bool nvmet_mdev_kvm_tracking_requested(void);
+void nvmet_mdev_kvm_tracking_init(struct nvmet_mdev_ctrl *ctrl);
+int nvmet_mdev_kvm_tracking_open(struct nvmet_mdev_ctrl *ctrl);
+void nvmet_mdev_kvm_tracking_close(struct nvmet_mdev_ctrl *ctrl);
+void nvmet_mdev_kvm_tracking_mmap(struct nvmet_mdev_ctrl *ctrl, unsigned long hva);
+void nvmet_mdev_kvm_tracking_config_changed(struct nvmet_mdev_ctrl *ctrl);
+bool nvmet_mdev_kvm_tracking_active(const struct nvmet_mdev_ctrl *ctrl);
+#else
+static inline bool nvmet_mdev_kvm_tracking_requested(void)
+{
+	return false;
+}
+
+static inline void nvmet_mdev_kvm_tracking_init(struct nvmet_mdev_ctrl *ctrl)
+{
+}
+
+static inline int nvmet_mdev_kvm_tracking_open(struct nvmet_mdev_ctrl *ctrl)
+{
+	return 0;
+}
+
+static inline void nvmet_mdev_kvm_tracking_close(struct nvmet_mdev_ctrl *ctrl)
+{
+}
+
+static inline void nvmet_mdev_kvm_tracking_mmap(struct nvmet_mdev_ctrl *ctrl,
+						unsigned long hva)
+{
+}
+
+static inline void
+nvmet_mdev_kvm_tracking_config_changed(struct nvmet_mdev_ctrl *ctrl)
+{
+}
+
+static inline bool
+nvmet_mdev_kvm_tracking_active(const struct nvmet_mdev_ctrl *ctrl)
+{
+	return false;
+}
+#endif
 void nvmet_mdev_queue_response(struct nvmet_req *req);
 u8 nvmet_mdev_get_mdts(const struct nvmet_ctrl *tctrl);
 u16 nvmet_mdev_create_sq(struct nvmet_ctrl *tctrl, u16 sqid, u16 cqid,

@@ -418,6 +418,7 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 	unsigned int doorbell_bytes = NVMET_MDEV_PCI_MSIX_TABLE - NVME_REG_DBS;
 	bool doorbells = false;
 	bool bar0 = false;
+	bool mapping_changed = false;
 	bool update_irqs = false;
 	int index, ret;
 
@@ -439,6 +440,12 @@ ssize_t nvmet_mdev_pci_write(struct nvmet_mdev_ctrl *ctrl,
 	}
 
 	if (index == VFIO_PCI_CONFIG_REGION_INDEX) {
+		mapping_changed =
+			nvmet_mdev_write_overlaps(offset, count, PCI_COMMAND,
+						  sizeof(u16)) ||
+			nvmet_mdev_write_overlaps(offset, count,
+						  PCI_BASE_ADDRESS_0,
+						  2 * sizeof(u32));
 		update_irqs = nvmet_mdev_write_overlaps(offset, count,
 							NVMET_MDEV_PCI_MSIX_CAP +
 							PCI_MSIX_FLAGS, sizeof(u16));
@@ -489,6 +496,8 @@ out_unlock:
 	if (ret < 0)
 		return ret;
 	if (!bar0) {
+		if (mapping_changed)
+			nvmet_mdev_kvm_tracking_config_changed(ctrl);
 		if (update_irqs)
 			nvmet_mdev_update_pending_irqs(ctrl);
 		return ret;
