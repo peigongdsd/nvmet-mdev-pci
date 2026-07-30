@@ -111,6 +111,7 @@ struct nvmet_mdev_payload {
 };
 
 struct nvmet_mdev_runtime_config {
+	/* Capacity and scheduling policy, snapshotted at mdev creation. */
 	unsigned int pin_cache_pages;
 	unsigned int pin_cache_max_segs;
 	unsigned int poll_budget;
@@ -118,6 +119,7 @@ struct nvmet_mdev_runtime_config {
 	u8 irq_coalesce_threshold;
 	u8 irq_coalesce_time;
 	bool lock_irq_coalescing;
+	/* Resolved transport capabilities, not independent feature switches. */
 	bool mmap_doorbells;
 	bool kvm_doorbell_tracking;
 };
@@ -331,6 +333,8 @@ int nvmet_mdev_vfio_init(void);
 void nvmet_mdev_vfio_exit(void);
 const struct class *nvmet_mdev_class(void);
 struct mdev_driver *nvmet_mdev_driver(void);
+
+void nvmet_mdev_snapshot_runtime_config(struct nvmet_mdev_ctrl *ctrl);
 
 int nvmet_mdev_pci_init(struct nvmet_mdev_ctrl *ctrl);
 void nvmet_mdev_pci_cleanup(struct nvmet_mdev_ctrl *ctrl);

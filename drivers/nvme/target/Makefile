@@ -25,7 +25,8 @@ nvme-fcloop-y	+= fcloop.o
 nvmet-tcp-y	+= tcp.o
 nvmet-pci-epf-y	+= pci-epf.o
 nvmet-mdev-pci-y	+= mdev-pci/main.o mdev-pci/target.o \
-			   mdev-pci/pci.o mdev-pci/irq.o mdev-pci/ctrl.o \
+			   mdev-pci/config.o mdev-pci/pci.o mdev-pci/irq.o \
+			   mdev-pci/ctrl.o \
 			   mdev-pci/iova.o mdev-pci/queue.o mdev-pci/vfio.o
 nvmet-mdev-pci-$(CONFIG_KVM_EXTERNAL_WRITE_TRACKING) += mdev-pci/kvm.o
 nvmet-$(CONFIG_TRACING)	+= trace.o

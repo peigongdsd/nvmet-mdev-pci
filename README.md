@@ -5,6 +5,7 @@ device. A VM sees an ordinary NVMe PCI controller while the host keeps nvmet's
 namespace and backend implementation.
 
 - [Usage and VM assignment](USAGE.md)
+- [Architecture and feature dependencies](ARCHITECTURE.md)
 - [Development and test status](DEVELOPING.md)
 - [Performance design and acceptance gates](PERFORMANCE.md)
 - [Queue, interrupt, and teardown invariants](CONCURRENCY.md)

@@ -4,14 +4,12 @@
 #include <linux/iommu.h>
 #include <linux/cpu.h>
 #include <linux/delay.h>
-#include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
 #include <linux/scatterlist.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
-#include <linux/stringify.h>
 #include <linux/unaligned.h>
 
 #include "../pci-common.h"
@@ -29,63 +27,6 @@ static_assert(offsetof(struct nvme_completion, status) +
 #define NVMET_MDEV_POLL_INTERVAL	msecs_to_jiffies(10)
 #define NVMET_MDEV_POLL_HOT_SCANS	4
 #define NVMET_MDEV_POLL_ACTIVE_US	5
-#define NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES	65536
-#define NVMET_MDEV_DEFAULT_PIN_CACHE_MAX_SEGS	64
-#define NVMET_MDEV_DEFAULT_POLL_BUDGET		128
-#define NVMET_MDEV_DEFAULT_RESPONSE_WORKERS	0
-#define NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR	0
-#define NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME	0
-#define NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING	false
-#define NVMET_MDEV_DEFAULT_MMAP_DOORBELLS	true
-
-static uint pin_cache_pages = NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES;
-module_param_named(pin_cache_pages, pin_cache_pages, uint, 0644);
-MODULE_PARM_DESC(pin_cache_pages,
-		 "Maximum cached guest pages per controller (default: "
-		 __stringify(NVMET_MDEV_DEFAULT_PIN_CACHE_PAGES) ")");
-
-static uint pin_cache_max_segs = NVMET_MDEV_DEFAULT_PIN_CACHE_MAX_SEGS;
-module_param_named(pin_cache_max_segs, pin_cache_max_segs, uint, 0644);
-MODULE_PARM_DESC(pin_cache_max_segs,
-		 "Maximum PRP segments admitted to the pin cache (default: "
-		 __stringify(NVMET_MDEV_DEFAULT_PIN_CACHE_MAX_SEGS) ")");
-
-static uint poll_budget = NVMET_MDEV_DEFAULT_POLL_BUDGET;
-module_param_named(poll_budget, poll_budget, uint, 0644);
-MODULE_PARM_DESC(poll_budget,
-		 "Maximum queues examined by one bounded doorbell poll run (default: "
-		 __stringify(NVMET_MDEV_DEFAULT_POLL_BUDGET) ")");
-
-static uint response_workers = NVMET_MDEV_DEFAULT_RESPONSE_WORKERS;
-module_param_named(response_workers, response_workers, uint, 0644);
-MODULE_PARM_DESC(response_workers,
-		 "Response cleanup workers per I/O SQ (default: "
-		 __stringify(NVMET_MDEV_DEFAULT_RESPONSE_WORKERS) ")");
-
-static u8 irq_coalesce_threshold = NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR;
-module_param_named(irq_coalesce_threshold, irq_coalesce_threshold, byte, 0644);
-MODULE_PARM_DESC(irq_coalesce_threshold,
-		 "Default NVMe Feature 08 THR (default: "
-		 __stringify(NVMET_MDEV_DEFAULT_IRQ_COALESCE_THR) ")");
-
-static u8 irq_coalesce_time = NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME;
-module_param_named(irq_coalesce_time, irq_coalesce_time, byte, 0644);
-MODULE_PARM_DESC(irq_coalesce_time,
-		 "Default NVMe Feature 08 TIME in 100 us units (default: "
-		 __stringify(NVMET_MDEV_DEFAULT_IRQ_COALESCE_TIME) ")");
-
-static bool lock_irq_coalescing = NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING;
-module_param_named(lock_irq_coalescing, lock_irq_coalescing, bool, 0644);
-MODULE_PARM_DESC(lock_irq_coalescing,
-		 "Reject guest changes to NVMe Features 08 and 09 (default: "
-		 __stringify(NVMET_MDEV_DEFAULT_LOCK_IRQ_COALESCING) ")");
-
-static bool mmap_doorbells = NVMET_MDEV_DEFAULT_MMAP_DOORBELLS;
-module_param_named(mmap_doorbells, mmap_doorbells, bool, 0644);
-MODULE_PARM_DESC(mmap_doorbells,
-		 "Expose the BAR0 doorbell page through VFIO sparse mmap (default: "
-		 __stringify(NVMET_MDEV_DEFAULT_MMAP_DOORBELLS) ")");
-
 struct nvmet_mdev_iod {
 	struct list_head entry;
 	struct llist_node free_node;
@@ -1137,19 +1078,7 @@ int nvmet_mdev_queue_init(struct nvmet_mdev_ctrl *ctrl)
 	unsigned int qid;
 	int ret;
 
-	ctrl->runtime.pin_cache_pages = READ_ONCE(pin_cache_pages);
-	ctrl->runtime.pin_cache_max_segs = READ_ONCE(pin_cache_max_segs);
-	ctrl->runtime.poll_budget = max_t(unsigned int, READ_ONCE(poll_budget), 1);
-	ctrl->runtime.response_workers = READ_ONCE(response_workers);
-	ctrl->runtime.irq_coalesce_threshold =
-		READ_ONCE(irq_coalesce_threshold);
-	ctrl->runtime.irq_coalesce_time = READ_ONCE(irq_coalesce_time);
-	ctrl->runtime.lock_irq_coalescing = READ_ONCE(lock_irq_coalescing);
-	ctrl->runtime.mmap_doorbells = READ_ONCE(mmap_doorbells) &&
-		PAGE_SIZE == SZ_4K;
-	ctrl->runtime.kvm_doorbell_tracking =
-		ctrl->runtime.mmap_doorbells &&
-		nvmet_mdev_kvm_tracking_requested();
+	nvmet_mdev_snapshot_runtime_config(ctrl);
 	nvmet_mdev_reset_irq_features(ctrl);
 	mutex_init(&ctrl->state_lock);
 	INIT_DELAYED_WORK(&ctrl->poll_work, nvmet_mdev_poll_work);

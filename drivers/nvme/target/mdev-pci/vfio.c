@@ -396,6 +396,15 @@ static ssize_t transport_stats_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(transport_stats);
 
+static const char *nvmet_mdev_doorbell_mode(struct nvmet_mdev_ctrl *ctrl)
+{
+	if (!ctrl->runtime.mmap_doorbells)
+		return "trapped";
+	if (nvmet_mdev_kvm_tracking_active(ctrl))
+		return "mmap-kvm";
+	return "mmap-poll";
+}
+
 static ssize_t runtime_config_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
@@ -414,13 +423,17 @@ static ssize_t runtime_config_show(struct device *dev,
 		"lock_irq_coalescing %u\n"
 		"mmap_doorbells %u\n"
 		"kvm_doorbell_tracking %u\n"
-		"kvm_doorbell_tracking_active %u\n",
+		"kvm_doorbell_tracking_active %u\n"
+		"doorbell_mode %s\n"
+		"dbbuf_active %u\n",
 		cfg->pin_cache_pages, cfg->pin_cache_max_segs,
 		cfg->poll_budget, cfg->response_workers,
 		cfg->irq_coalesce_threshold, cfg->irq_coalesce_time,
 		cfg->lock_irq_coalescing, cfg->mmap_doorbells,
 		cfg->kvm_doorbell_tracking,
-		nvmet_mdev_kvm_tracking_active(ctrl));
+		nvmet_mdev_kvm_tracking_active(ctrl),
+		nvmet_mdev_doorbell_mode(ctrl),
+		!!READ_ONCE(ctrl->dbbuf_dbs));
 }
 static DEVICE_ATTR_RO(runtime_config);
 
