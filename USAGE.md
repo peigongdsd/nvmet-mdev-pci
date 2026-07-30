@@ -166,6 +166,11 @@ mdev before testing a new value.
 | `pin_cache_max_segs` | 64 | Admit requests with at most 64 PRP segments, covering common 128 KiB I/O. |
 | `poll_budget` | 128 | Maximum queue pairs examined by one safety scan. |
 | `response_workers` | 0 | Response cleanup workers per I/O SQ; 0 selects an automatic count, while 1 serializes cleanup. |
+| `irq_coalesce_threshold` | 0 | Initial NVMe Feature 08 THR value. |
+| `irq_coalesce_time` | 0 | Initial NVMe Feature 08 TIME value in 100 us units. |
+| `lock_irq_coalescing` | false | Reject guest changes to NVMe Features 08 and 09. |
+| `mmap_doorbells` | true | Offer the isolated 4 KiB BAR0 doorbell page through VFIO sparse mmap. |
+| `kvm_doorbell_tracking` | true | Request x86 KVM write tracking for the sparse-mapped doorbell page when compiled in. |
 
 Cold consecutive cache misses are pinned in batches. Setting either cache
 limit to zero disables caching while retaining request-lifetime pinned I/O.
@@ -176,12 +181,23 @@ Use `response_workers=1` to measure serialized cleanup. Automatic mode uses up
 to one worker per online CPU, capped by SQ depth and 64; an explicit value is
 clamped to the same bounds. The admin SQ always uses one ordered worker.
 
+The doorbell switches are dependent rather than peer implementation modes.
+KVM tracking requires effective sparse mmap, and sparse mmap requires 4 KiB
+host pages. If tracking is disabled, unavailable or not yet active, sparse
+mmap remains correct through adaptive polling. Guest-negotiated DBBUF is
+independent and currently retains shadow-doorbell polling. See
+`ARCHITECTURE.md` for the complete combination matrix.
+
 Verify the snapshot and counters on the newly created device:
 
 ```sh
 cat "$MDEV/runtime_config"
 cat "$MDEV/transport_stats"
 ```
+
+`runtime_config` distinguishes requested/resolved booleans from the dynamic
+effective state. `doorbell_mode` is `trapped`, `mmap-poll`, or `mmap-kvm`, and
+`dbbuf_active` reports the independently negotiated shadow-doorbell path.
 
 The counters include heap allocations, pin/unpin calls, cache hits/misses and
 evictions, IOD recycle hits/misses, response worker runs/batches/items, SQ/CQ

@@ -13,7 +13,7 @@
 static bool kvm_doorbell_tracking = true;
 module_param_named(kvm_doorbell_tracking, kvm_doorbell_tracking, bool, 0644);
 MODULE_PARM_DESC(kvm_doorbell_tracking,
-		 "Use KVM tracking for sparse BAR0 doorbells (default: true)");
+		 "Request KVM tracking for sparse BAR0 doorbells (default: true)");
 
 bool nvmet_mdev_kvm_tracking_requested(void)
 {

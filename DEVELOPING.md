@@ -114,8 +114,11 @@ tools/testing/kunit/kunit.py run \
 8. Pin payload pages for zero-copy I/O, then add shadow doorbells and interrupt
    coalescing.
 
-The normal BAR doorbells will remain trapped so they can wake an idle backend.
-The steady-state fast path will use NVMe shadow doorbells in guest memory.
+The current production path can sparse-map the isolated BAR doorbell page.
+Without KVM write tracking it uses bounded adaptive polling; with active x86
+KVM tracking the callback wakes the affected queue and BAR polling parks.
+DBBUF shadow doorbells remain an independent guest-negotiated path and are
+currently polled. See `ARCHITECTURE.md` for the dependency and fallback matrix.
 
 ## Current milestone
 
